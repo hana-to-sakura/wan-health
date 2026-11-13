@@ -49,7 +49,7 @@ const LAB_ITEMS = [
   ['eos', '好酸球数 (EOS)', 'K/µL'], ['baso', '好塩基球数 (BASO)', 'K/µL'],
   ['neu_p', '好中球% (%NEU)', '%'], ['lym_p', 'リンパ球% (%LYM)', '%'], ['mono_p', '単球% (%MONO)', '%'],
   ['eos_p', '好酸球% (%EOS)', '%'], ['baso_p', '好塩基球% (%BASO)', '%'],
-  ['mpv', 'MPV（平均血小板容積）', 'fL'], ['pdw', 'PDW（血小板分布幅）', 'fL'], ['pct', 'PCT（血小板クリット）', '%'],
+  ['mpv', 'MPV（平均血小板容積）', 'fL'], ['pdw', 'PDW（血小板分布幅）', 'fL'], ['pct', 'PCT（血小板クリット）', 'fL'],
 ];
 // AIがキーを付けなかった項目を、用紙の項目名（略号）から対応づけるための別名
 const LAB_ALIASES = {
@@ -690,8 +690,9 @@ function parseLabReply(text) {
   const out = { date: isDate(data.date) && data.date <= todayStr() ? data.date : '', values: {}, refs: {}, others: [] };
   for (const it of data.items.slice(0, 80)) {
     if (!it || typeof it !== 'object') continue;
-    const key = typeof it.key === 'string' && Object.prototype.hasOwnProperty.call(LAB_BY_KEY, it.key)
-      ? it.key : (typeof it.name === 'string' ? labKeyFromName(it.name) : '');
+    // 用紙の略号（%RETIC など）から決まるならそれを優先し、決まらないときだけAIが付けたキーを使う
+    const key = (typeof it.name === 'string' && labKeyFromName(it.name))
+      || (typeof it.key === 'string' && Object.prototype.hasOwnProperty.call(LAB_BY_KEY, it.key) ? it.key : '');
     const value = num(it.value);
     if (key && value != null && !(key in out.values)) {
       out.values[key] = value;
