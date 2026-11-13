@@ -43,8 +43,26 @@ const LAB_ITEMS = [
   ['crp', 'CRP', 'mg/dL'],
   ['glob', 'グロブリン (GLOB)', 'g/dL'], ['amy', 'アミラーゼ (AMY)', 'U/L'], ['lip', 'リパーゼ (LIP)', 'U/L'],
   ['ck', 'CK (CPK)', 'U/L'], ['ldh', 'LDH', 'U/L'], ['nh3', 'アンモニア (NH3)', 'µg/dL'], ['sdma', 'SDMA', 'µg/dL'],
-  ['mcv', 'MCV', 'fL'], ['mch', 'MCH', 'pg'], ['mchc', 'MCHC', 'g/dL'], ['ret', '網赤血球 (RET)', '%'],
+  ['mcv', 'MCV', 'fL'], ['mch', 'MCH', 'pg'], ['mchc', 'MCHC', 'g/dL'], ['rdw', 'RDW（赤血球分布幅）', '%'],
+  ['ret', '網赤血球% (%RETIC)', '%'], ['retn', '網赤血球数 (RETIC)', 'K/µL'],
+  ['neu', '好中球数 (NEU)', 'K/µL'], ['lym', 'リンパ球数 (LYM)', 'K/µL'], ['mono', '単球数 (MONO)', 'K/µL'],
+  ['eos', '好酸球数 (EOS)', 'K/µL'], ['baso', '好塩基球数 (BASO)', 'K/µL'],
+  ['neu_p', '好中球% (%NEU)', '%'], ['lym_p', 'リンパ球% (%LYM)', '%'], ['mono_p', '単球% (%MONO)', '%'],
+  ['eos_p', '好酸球% (%EOS)', '%'], ['baso_p', '好塩基球% (%BASO)', '%'],
+  ['mpv', 'MPV（平均血小板容積）', 'fL'], ['pdw', 'PDW（血小板分布幅）', 'fL'], ['pct', 'PCT（血小板クリット）', '%'],
 ];
+// AIがキーを付けなかった項目を、用紙の項目名（略号）から対応づけるための別名
+const LAB_ALIASES = {
+  ...Object.fromEntries(LAB_ITEMS.map(([key]) => [key.toUpperCase(), key])),
+  GPT: 'alt', GOT: 'ast', CREA: 'cre', 'T-CHO': 'tcho', CHOL: 'tcho', 'T-BIL': 'tbil', PHOS: 'ip',
+  AMYL: 'amy', LIPA: 'lip', CPK: 'ck', HB: 'hgb', PCV: 'hct', 'γ-GTP': 'ggt', 'Γ-GTP': 'ggt',
+  '%RETIC': 'ret', RETIC: 'retn', RET: 'ret',
+  '%NEU': 'neu_p', '%LYM': 'lym_p', '%MONO': 'mono_p', '%EOS': 'eos_p', '%BASO': 'baso_p',
+};
+function labKeyFromName(name) {
+  const token = String(name).replace(/％/g, '%').trim().toUpperCase().split(/[\s(（:：]+/)[0];
+  return Object.prototype.hasOwnProperty.call(LAB_ALIASES, token) ? LAB_ALIASES[token] : '';
+}
 const LAB_BY_KEY = Object.fromEntries(LAB_ITEMS.map(([key, label, unit]) => [key, { label, unit }]));
 
 // ふりかえりで「気になるサイン」として拾う記録
@@ -672,7 +690,8 @@ function parseLabReply(text) {
   const out = { date: isDate(data.date) && data.date <= todayStr() ? data.date : '', values: {}, refs: {}, others: [] };
   for (const it of data.items.slice(0, 80)) {
     if (!it || typeof it !== 'object') continue;
-    const key = typeof it.key === 'string' && Object.prototype.hasOwnProperty.call(LAB_BY_KEY, it.key) ? it.key : '';
+    const key = typeof it.key === 'string' && Object.prototype.hasOwnProperty.call(LAB_BY_KEY, it.key)
+      ? it.key : (typeof it.name === 'string' ? labKeyFromName(it.name) : '');
     const value = num(it.value);
     if (key && value != null && !(key in out.values)) {
       out.values[key] = value;
