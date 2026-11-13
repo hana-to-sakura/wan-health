@@ -904,12 +904,14 @@ function careForm(dog, rec, preset) {
 /* ---------- forms: blood test ---------- */
 
 // AIアプリ（Claude など）に貼り付けて使う、読み取り用の指示文
-function labPrompt() {
-  return `添付した犬の血液検査結果の画像を読み取り、次のJSONだけを答えてください。説明や前置きは不要です。
+// bulk: 複数枚をまとめて読ませ、{"records":[…]} で受け取る
+function labPrompt(bulk) {
+  const one = '{"date":"検査日 YYYY-MM-DD（不明なら null）","items":[{"key":"下の一覧のキー（該当なしは null）","name":"用紙に書かれた項目名","value":数値,"unit":"単位","ref_low":基準値の下限（なければ null）,"ref_high":基準値の上限（なければ null）}]}';
+  return `添付した犬の血液検査結果の画像${bulk ? '（複数枚）' : ''}を読み取り、次のJSONだけを答えてください。説明や前置きは不要です。
 
-{"date":"検査日 YYYY-MM-DD（不明なら null）","items":[{"key":"下の一覧のキー（該当なしは null）","name":"用紙に書かれた項目名","value":数値,"unit":"単位","ref_low":基準値の下限（なければ null）,"ref_high":基準値の上限（なければ null）}]}
+${bulk ? `{"records":[${one}, …検査日の数だけ]}` : one}
 
-ルール:
+ルール:${bulk ? '\n- 検査日ごとに1件にする。同じ検査日の用紙が複数枚あれば1件にまとめ、検査日の古い順に並べる。' : ''}
 - 数値は用紙に書かれたとおりに。単位の換算や丸めはしない。
 - 「<0.3」のように不等号が付いた値は、value を文字列（例 "<0.3"）にする。
 - 読み取れない、または自信がない項目は含めない。推測で埋めない。
@@ -920,11 +922,24 @@ ${LAB_ITEMS.map(([key, label]) => `${key}: ${label}`).join('\n')}`;
 }
 
 // AIの返事（JSONを含むテキスト）を検査値に変換する。貼り付けられた文字列は信用せず、数値と短い文字列だけ取り出す
-function parseLabReply(text) {
+function parseJsonReply(text) {
   const a = text.indexOf('{'), b = text.lastIndexOf('}');
   if (a < 0 || b <= a) return null;
-  let data;
-  try { data = JSON.parse(text.slice(a, b + 1)); } catch (e) { return null; }
+  const body = text.slice(a, b + 1);
+  try { return JSON.parse(body); } catch (e) { /* 配列だけが返ってきた場合 */ }
+  try { return JSON.parse(`[${body}]`); } catch (e) { return null; }
+}
+const parseLabReply = (text) => labFromData(parseJsonReply(text));
+const parseCareReply = (text) => careFromData(parseJsonReply(text));
+// まとめて取り込み用：返事に入っている記録を1件ずつ取り出す
+function parseBulkReply(text, one) {
+  const data = parseJsonReply(text);
+  if (!data || typeof data !== 'object') return [];
+  const list = Array.isArray(data) ? data : Array.isArray(data.records) ? data.records : [data];
+  return list.slice(0, 40).map(one).filter(Boolean);
+}
+
+function labFromData(data) {
   if (!data || !Array.isArray(data.items)) return null;
   const num = (v) => (typeof v === 'number' && Number.isFinite(v) && v >= 0 ? v : null);
   const short = (v) => (typeof v === 'string' || typeof v === 'number' ? String(v).replace(/\s+/g, ' ').trim().slice(0, 40) : '');
@@ -982,12 +997,13 @@ const aiHtml = (what) => `
 const LAB_AI_HTML = aiHtml('検査結果');
 
 // 診療明細書・領収書の読み取り用の指示文
-function carePrompt() {
-  return `添付した動物病院の診療明細書（または領収書）の画像を読み取り、次のJSONだけを答えてください。説明や前置きは不要です。
+function carePrompt(bulk) {
+  const one = '{"date":"診療日 YYYY-MM-DD（不明なら null）","hospital":"病院名（不明なら null）","total":実際に支払った合計金額（税込・円・数値）,"kind":"下の一覧から最も近いキー","items":[{"category":"exam / test / treat / med / other のどれか","name":"明細の項目名（用紙の表記のまま）","quantity":"数量や日数（用紙の表記のまま。なければ null）","amount":金額（円・数値。なければ null）}]}';
+  return `添付した動物病院の診療明細書（または領収書）の画像${bulk ? '（複数枚）' : ''}を読み取り、次のJSONだけを答えてください。説明や前置きは不要です。
 
-{"date":"診療日 YYYY-MM-DD（不明なら null）","hospital":"病院名（不明なら null）","total":実際に支払った合計金額（税込・円・数値）,"kind":"下の一覧から最も近いキー","items":[{"category":"exam / test / treat / med / other のどれか","name":"明細の項目名（用紙の表記のまま）","quantity":"数量や日数（用紙の表記のまま。なければ null）","amount":金額（円・数値。なければ null）}]}
+${bulk ? `{"records":[${one}, …会計の数だけ]}` : one}
 
-ルール:
+ルール:${bulk ? '\n- 1回の会計（明細書1通）ごとに1件にする。同じ会計の用紙が複数枚あれば1件にまとめ、診療日の古い順に並べる。' : ''}
 - 明細の行は省略せず、用紙に書かれた順にすべて含める。薬は名前と用量を用紙の表記のまま書く。
 - category は、exam=診察料など、test=検査、treat=処置・注射・点滴など、med=処方された薬、other=それ以外（消費税・値引きなど）。
 - 金額は用紙に書かれたとおりに。合計は税込で、保険などの差し引きがあれば差し引き後の支払額にする。
@@ -997,12 +1013,8 @@ kind のキーの一覧:
 ${Object.entries(CARE_KINDS).map(([key, k]) => `${key}: ${k.label}`).join('\n')}`;
 }
 
-function parseCareReply(text) {
-  const a = text.indexOf('{'), b = text.lastIndexOf('}');
-  if (a < 0 || b <= a) return null;
-  let data;
-  try { data = JSON.parse(text.slice(a, b + 1)); } catch (e) { return null; }
-  if (!data || typeof data !== 'object') return null;
+function careFromData(data) {
+  if (!data || typeof data !== 'object' || Array.isArray(data)) return null;
   const money = (v) => (typeof v === 'number' && Number.isFinite(v) && v > 0 && v <= 9999999 ? Math.round(v) : 0);
   const short = (v, max) => (typeof v === 'string' ? v.replace(/\s+/g, ' ').trim().slice(0, max) : '');
   const out = {
@@ -1020,6 +1032,103 @@ function parseCareReply(text) {
       })),
   };
   return out.total || out.items.length ? out : null;
+}
+
+// 過去分をまとめて取り込む。kind: 'lab'（血液検査）/ 'care'（診療明細）
+function bulkForm(dog, kind) {
+  const isLab = kind === 'lab';
+  const what = isLab ? '血液検査結果' : '診療明細書';
+  let recs = [];
+  const exists = (r) => !!r.date && (isLab
+    ? state.labs.some((l) => l.dogId === dog.id && l.date === r.date)
+    : state.cares.some((c) => c.dogId === dog.id && c.date === r.date && (!r.total || c.cost === r.total)));
+  const describe = (r) => {
+    if (isLab) return `${Object.keys(r.values).length}項目${r.others.length ? `（ほかに一覧にない${r.others.length}項目はメモへ）` : ''}`;
+    const meds = r.items.filter((it) => it.cat === 'med').map((it) => it.name);
+    return [r.hospital, r.total ? `合計 ${yen(r.total)}` : '合計は読み取れず', r.items.length ? `明細${r.items.length}件` : '', meds.length ? `薬: ${meds.join('、')}` : '']
+      .filter(Boolean).join('・');
+  };
+  openForm({
+    title: `${what}をまとめて取り込む`,
+    fields: [{
+      type: 'custom', html: `<div class="ai-body bulk">
+        <p class="hint">${what}の写真を何枚かまとめてAIアプリ（Claude など）に読ませて、複数の日の記録を一度に作ります。</p>
+        <ol>
+          <li>下のボタンで、まとめ読み用の指示をコピーします。</li>
+          <li>AIアプリで写真を添付し（一度に5枚くらいまで）、指示を貼り付けて送ります。</li>
+          <li>返ってきた答えをコピーして下の欄に貼り付け、「内容を確認する」を押します。</li>
+          <li>出てきた一覧を確かめて「保存」を押します。</li>
+        </ol>
+        <button type="button" class="btn sm" data-role="copy-prompt">まとめ読み用の指示をコピー</button>
+        <textarea data-role="ai-text" aria-label="AIの返事を貼り付ける欄" placeholder="AIの返事をここに貼り付け"></textarea>
+        <button type="button" class="btn sm" data-role="ai-import">内容を確認する</button>
+        <p class="hint" data-role="ai-result" role="status"></p>
+        <ul class="bulk-list" data-role="bulk-list"></ul>
+      </div>`,
+    }],
+    onMount(form) {
+      const el = (role) => $(`[data-role="${role}"]`, form);
+      el('copy-prompt').addEventListener('click', async () => {
+        toast((await copyText(isLab ? labPrompt(true) : carePrompt(true), form)) ? '指示をコピーしました' : 'コピーできませんでした');
+      });
+      el('ai-import').addEventListener('click', () => {
+        recs = parseBulkReply(el('ai-text').value, isLab ? labFromData : careFromData)
+          .filter((r) => (isLab ? Object.keys(r.values).length : true))
+          .sort((a, b) => (a.date || '9').localeCompare(b.date || '9'));
+        if (!recs.length) {
+          el('bulk-list').innerHTML = '';
+          el('ai-result').textContent = '読み取れる内容が見つかりませんでした。AIの返事をそのまま貼り付けてください。';
+          return;
+        }
+        const dup = recs.filter(exists).length;
+        el('bulk-list').innerHTML = recs.map((r, i) => {
+          const d = exists(r);
+          return `<li class="bulk-row">
+            <label><input type="checkbox" data-pick="${i}"${d ? '' : ' checked'}> 取り込む</label>
+            <input type="date" data-date="${i}" value="${esc(r.date)}" max="${todayStr()}" aria-label="${i + 1}件目の日付">
+            <div class="small">${esc(describe(r))}</div>
+            ${d ? '<div class="hint warn">同じ日の記録がすでにあります。二重にならないよう、チェックを外してあります。</div>' : ''}
+            ${r.date ? '' : '<div class="hint warn">日付が読み取れませんでした。用紙を見て入れてください。</div>'}
+          </li>`;
+        }).join('');
+        el('ai-result').textContent = `${recs.length}件が見つかりました。${dup ? `うち${dup}件は登録済みのようです。` : ''}`
+          + 'AIは読み間違えることがあるので、日付と件数を用紙と見比べてから保存してください。';
+        el('ai-text').value = '';
+      });
+    },
+    onSubmit() {
+      const dlg = $('#formDialog');
+      if (!recs.length) { toast('先に答えを貼り付けて「内容を確認する」を押してください'); return false; }
+      const picked = [];
+      for (let i = 0; i < recs.length; i++) {
+        if (!$(`[data-pick="${i}"]`, dlg).checked) continue;
+        const date = $(`[data-date="${i}"]`, dlg).value;
+        if (!isDate(date) || date > todayStr()) { toast(`${i + 1}件目の日付を入れてください`); return false; }
+        picked.push({ ...recs[i], date });
+      }
+      if (!picked.length) { toast('取り込む記録を1件以上選んでください'); return false; }
+      if (isLab) {
+        for (const r of picked) {
+          state.labs.push({
+            id: uid(), dogId: dog.id, date: r.date, photoIds: [], values: r.values,
+            memo: r.others.length ? `その他の項目: ${r.others.join(' / ')}`.slice(0, 1000) : '',
+          });
+        }
+        // 基準値は、未設定の項目だけ新しい検査のものから登録する
+        for (const r of picked.slice().sort((a, b) => b.date.localeCompare(a.date))) {
+          for (const [key, ref] of Object.entries(r.refs)) if (!state.labRefs[key]) state.labRefs[key] = ref;
+        }
+      } else {
+        for (const r of picked) {
+          state.cares.push({
+            id: uid(), dogId: dog.id, kind: r.kind || 'vet', title: r.hospital, date: r.date, nextDate: '',
+            cost: r.total, memo: '', items: r.items, photoIds: [],
+          });
+        }
+      }
+      commit(`${picked.length}件を取り込みました`);
+    },
+  });
 }
 
 function labForm(dog, rec) {
@@ -1319,7 +1428,8 @@ function bloodView(dog) {
   const rowsItems = ui.labOnly ? shown.filter(([key]) => isOut(key)) : shown;
   const item = LAB_BY_KEY[ui.labItem];
   return `
-    <button type="button" class="btn primary" data-action="add-lab" style="width:100%;margin-bottom:16px">＋ 血液検査を記録</button>
+    <button type="button" class="btn primary" data-action="add-lab" style="width:100%;margin-bottom:8px">＋ 血液検査を記録</button>
+    <button type="button" class="btn" data-action="bulk-lab" style="width:100%;margin-bottom:16px">📥 過去の検査をまとめて取り込む</button>
     ${withData.length ? `
     <section class="card">
       <h2>推移</h2>
@@ -1626,6 +1736,7 @@ const VIEWS = {
     const yearCost = history.filter((c) => c.date >= yearStart).reduce((s, c) => s + c.cost, 0);
     return `
       <button type="button" class="btn primary" data-action="add-care" style="width:100%;margin-bottom:8px">＋ 予防・通院を記録</button>
+      <button type="button" class="btn" data-action="bulk-care" style="width:100%;margin-bottom:8px">📥 過去の明細をまとめて取り込む</button>
       <button type="button" class="btn" data-action="goto-summary" style="width:100%;margin-bottom:16px">📋 診察前まとめを見る</button>
       <section class="card">
         <h2>次回の予定</h2>
@@ -1983,6 +2094,8 @@ const ACTIONS = {
   'add-lab': (el, dog) => dog && labForm(dog, null),
   'edit-lab': (el, dog) => { const l = state.labs.find((x) => x.id === el.dataset.id); if (l && dog) labForm(dog, l); },
   'edit-refs': () => labRefForm(),
+  'bulk-lab': (el, dog) => dog && bulkForm(dog, 'lab'),
+  'bulk-care': (el, dog) => dog && bulkForm(dog, 'care'),
   'export': exportData,
   'import': () => $('#importFile').click(),
 };
