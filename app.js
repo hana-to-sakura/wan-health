@@ -30,6 +30,16 @@ const CARE_KINDS = {
   other:    { label: 'その他',           icon: '📌', months: 0 },
 };
 
+// 診療明細の区分
+const ITEM_CATS = {
+  exam:  { label: '診察', icon: '🩺' },
+  test:  { label: '検査', icon: '🧪' },
+  treat: { label: '処置・注射', icon: '💉' },
+  med:   { label: '薬', icon: '💊' },
+  other: { label: 'その他', icon: '📎' },
+};
+const MAX_CARE_ITEMS = 60;
+
 // 血液検査の項目。単位は一般的な表記の目安（病院によって異なる）
 const LAB_ITEMS = [
   ['wbc', '白血球数 (WBC)', '/µL'], ['rbc', '赤血球数 (RBC)', '万/µL'], ['hgb', 'ヘモグロビン (HGB)', 'g/dL'],
@@ -240,6 +250,7 @@ const referencedPhotoIds = (s) => [
   ...s.dogs.map((d) => d.photoId).filter(Boolean),
   ...s.logs.flatMap((l) => l.photoIds),
   ...s.labs.flatMap((l) => l.photoIds),
+  ...s.cares.flatMap((c) => c.photoIds),
 ];
 
 /* ---------- state & storage ---------- */
@@ -288,6 +299,13 @@ function normalize(raw) {
       title: str(c.title, 100), date: date(c.date), nextDate: date(c.nextDate),
       cost: Number.isFinite(Number(c.cost)) && Number(c.cost) > 0 ? Math.round(Number(c.cost)) : 0,
       memo: str(c.memo, 1000),
+      items: arr(c.items).slice(0, MAX_CARE_ITEMS).map((it) => ({
+        cat: Object.prototype.hasOwnProperty.call(ITEM_CATS, it.cat) ? it.cat : 'other',
+        name: str(it.name, 80).trim(), qty: str(it.qty, 20).trim(),
+        amount: Number.isFinite(Number(it.amount)) && Number(it.amount) > 0 ? Math.round(Number(it.amount)) : 0,
+      })).filter((it) => it.name),
+      photoIds: (Array.isArray(c.photoIds) ? c.photoIds : [])
+        .filter((p) => typeof p === 'string' && p).map((p) => p.slice(0, 40)).slice(0, MAX_LOG_PHOTOS),
     }))
     .filter((c) => ids.has(c.dogId) && c.date && Object.prototype.hasOwnProperty.call(CARE_KINDS, c.kind));
 
@@ -551,7 +569,7 @@ function dogForm(dog) {
 
 function deleteDog(dog) {
   if (!confirm(`「${dog.name}」と、その記録をすべて削除します。元に戻せません。よろしいですか？`)) return;
-  photoDel([dog.photoId, ...[...state.logs, ...state.labs].filter((l) => l.dogId === dog.id).flatMap((l) => l.photoIds)].filter(Boolean));
+  photoDel([dog.photoId, ...[...state.logs, ...state.labs, ...state.cares].filter((l) => l.dogId === dog.id).flatMap((l) => l.photoIds)].filter(Boolean));
   state.dogs = state.dogs.filter((d) => d.id !== dog.id);
   for (const key of ['weights', 'logs', 'cares', 'labs']) state[key] = state[key].filter((r) => r.dogId !== dog.id);
   if (state.activeDogId === dog.id) state.activeDogId = state.dogs[0] ? state.dogs[0].id : null;
@@ -622,14 +640,23 @@ function weightForm(dog, rec) {
 
 function careForm(dog, rec, preset) {
   const c = rec || preset || {};
+  let collectItems = () => (rec && rec.items) || [];
   openForm({
     title: rec ? '予防・通院の記録を編集' : '予防・通院を記録',
     fields: [
+      { name: 'photos', label: '明細書・領収書の写真', type: 'photos', max: MAX_LOG_PHOTOS, maxSide: 2000, value: (rec && rec.photoIds) || [] },
+      { type: 'custom', html: aiHtml('診療明細書') },
       { name: 'kind', label: '種類', type: 'select', value: c.kind || 'vet', options: Object.entries(CARE_KINDS).map(([k, v]) => [k, v.label]) },
       { name: 'title', label: '内容', maxlength: 100, value: c.title, placeholder: '例：薬の名前、診察内容、病院名' },
       { name: 'date', label: '実施日', type: 'date', required: true, max: todayStr(), value: (rec && rec.date) || todayStr() },
       { name: 'nextDate', label: '次回予定日', type: 'date', value: rec ? rec.nextDate : '', hint: 'ワクチンや予防薬は目安の日付が自動で入ります。病院の指示に合わせて変更してください。' },
       { name: 'cost', label: '費用（円）', type: 'number', min: 0, max: 9999999, step: 1, inputmode: 'numeric', value: (rec && rec.cost) || '' },
+      {
+        type: 'custom', html: `<div class="field"><span class="field-label">明細（診察内容・薬） <span class="muted small">任意</span></span>
+          <div class="item-rows" data-role="items"></div>
+          <button type="button" class="btn sm" data-role="add-item" style="align-self:flex-start">＋ 明細を追加</button>
+          <span class="hint" data-role="items-sum"></span></div>`,
+      },
       { name: 'memo', label: 'メモ', type: 'textarea', value: rec ? rec.memo : '' },
     ],
     onMount(form) {
@@ -644,19 +671,69 @@ function careForm(dog, rec, preset) {
       el.kind.addEventListener('change', sync);
       el.date.addEventListener('change', sync);
       sync();
+
+      const role = (name) => $(`[data-role="${name}"]`, form);
+
+      // 明細の行（区分・項目名・数量・金額）
+      const rows = role('items');
+      const rowHtml = (it) => `<div class="item-row">
+        <select data-k="cat" aria-label="区分">${Object.entries(ITEM_CATS).map(([k, c]) => `<option value="${k}"${k === it.cat ? ' selected' : ''}>${c.label}</option>`).join('')}</select>
+        <input type="text" data-k="name" aria-label="項目名" maxlength="80" placeholder="項目名・薬の名前" value="${esc(it.name)}">
+        <button type="button" class="btn sm danger" data-role="del-item" aria-label="この明細を削除">✕</button>
+        <input type="text" data-k="qty" aria-label="数量" maxlength="20" placeholder="数量" value="${esc(it.qty)}">
+        <input type="number" data-k="amount" aria-label="金額（円）" min="0" max="9999999" step="1" inputmode="numeric" placeholder="金額（円）" value="${it.amount || ''}">
+      </div>`;
+      collectItems = () => [...rows.querySelectorAll('.item-row')].map((r) => {
+        const get = (k) => $(`[data-k="${k}"]`, r).value.trim();
+        return { cat: get('cat'), name: get('name'), qty: get('qty'), amount: Number(get('amount')) > 0 ? Math.round(Number(get('amount'))) : 0 };
+      }).filter((it) => it.name).slice(0, MAX_CARE_ITEMS);
+      const showSum = () => {
+        const items = collectItems();
+        role('items-sum').textContent = items.length ? `明細${items.length}件・合計 ${yen(items.reduce((s, it) => s + it.amount, 0))}` : '';
+      };
+      const setItems = (items) => { rows.innerHTML = items.map(rowHtml).join(''); showSum(); };
+      rows.addEventListener('input', showSum);
+      rows.addEventListener('click', (e) => {
+        const b = e.target.closest('[data-role="del-item"]');
+        if (b) { b.closest('.item-row').remove(); showSum(); }
+      });
+      role('add-item').addEventListener('click', () => {
+        if (rows.children.length >= MAX_CARE_ITEMS) return;
+        rows.insertAdjacentHTML('beforeend', rowHtml({ cat: 'med', name: '', qty: '', amount: 0 }));
+        $('[data-k="name"]', rows.lastElementChild).focus();
+      });
+      setItems((rec && rec.items) || []);
+
+      role('copy-prompt').addEventListener('click', async () => {
+        toast((await copyText(carePrompt(), form)) ? '指示をコピーしました' : 'コピーできませんでした');
+      });
+      role('ai-import').addEventListener('click', () => {
+        const parsed = parseCareReply(role('ai-text').value);
+        if (!parsed) { role('ai-result').textContent = '読み取れる内容が見つかりませんでした。AIの返事をそのまま貼り付けてください。'; return; }
+        if (parsed.date) el.date.value = parsed.date;
+        if (parsed.kind) el.kind.value = parsed.kind;
+        if (parsed.hospital && !el.title.value) el.title.value = parsed.hospital;
+        if (parsed.total) el.cost.value = parsed.total;
+        if (parsed.items.length) setItems(parsed.items);
+        sync();
+        role('ai-result').textContent = `${parsed.total ? `合計 ${yen(parsed.total)} を入力しました。` : '合計金額は読み取れませんでした。'}`
+          + (parsed.items.length ? `明細${parsed.items.length}件を入力しました。` : '')
+          + 'AIは読み間違えることがあるので、保存前に明細書と見比べて確認してください。';
+        role('ai-text').value = '';
+      });
     },
     onSubmit(v) {
       if (!isDate(v.date)) return false;
       if (v.nextDate && v.nextDate <= v.date) { toast('次回予定日は実施日より後にしてください'); return false; }
       const data = {
         kind: v.kind, title: v.title, date: v.date, nextDate: isDate(v.nextDate) ? v.nextDate : '',
-        cost: Number(v.cost) > 0 ? Math.round(Number(v.cost)) : 0, memo: v.memo,
+        cost: Number(v.cost) > 0 ? Math.round(Number(v.cost)) : 0, memo: v.memo, photoIds: v.photos, items: collectItems(),
       };
       if (rec) Object.assign(rec, data);
       else state.cares.push({ id: uid(), dogId: dog.id, ...data });
       commit('記録しました');
     },
-    onDelete: rec ? () => { state.cares = state.cares.filter((x) => x.id !== rec.id); commit('削除しました'); } : null,
+    onDelete: rec ? () => { photoDel(rec.photoIds); state.cares = state.cares.filter((x) => x.id !== rec.id); commit('削除しました'); } : null,
   });
 }
 
@@ -725,19 +802,61 @@ async function copyText(text, host) {
   }
 }
 
-const LAB_AI_HTML = `
-  <fieldset class="group ai-read"><legend>AIで読み取る（任意）</legend>
-    <p class="hint">Claude などのAIアプリに検査結果の写真を読ませて、数値をまとめて入力できます。</p>
+const aiHtml = (what) => `
+  <details class="ai-read"><summary>AIで読み取る（任意）</summary><div class="ai-body">
+    <p class="hint">Claude などのAIアプリに${what}の写真を読ませて、内容をまとめて入力できます。</p>
     <ol>
       <li>下のボタンで、読み取り用の指示をコピーします。</li>
-      <li>AIアプリで検査結果の写真を添付し、指示を貼り付けて送ります。</li>
+      <li>AIアプリで${what}の写真を添付し、指示を貼り付けて送ります。</li>
       <li>返ってきた答えをコピーして、下の欄に貼り付けます。</li>
     </ol>
     <button type="button" class="btn sm" data-role="copy-prompt">読み取り用の指示をコピー</button>
     <textarea data-role="ai-text" aria-label="AIの返事を貼り付ける欄" placeholder="AIの返事をここに貼り付け"></textarea>
     <button type="button" class="btn sm" data-role="ai-import">貼り付けた内容を取り込む</button>
     <p class="hint" data-role="ai-result" role="status"></p>
-  </fieldset>`;
+  </div></details>`;
+const LAB_AI_HTML = aiHtml('検査結果');
+
+// 診療明細書・領収書の読み取り用の指示文
+function carePrompt() {
+  return `添付した動物病院の診療明細書（または領収書）の画像を読み取り、次のJSONだけを答えてください。説明や前置きは不要です。
+
+{"date":"診療日 YYYY-MM-DD（不明なら null）","hospital":"病院名（不明なら null）","total":実際に支払った合計金額（税込・円・数値）,"kind":"下の一覧から最も近いキー","items":[{"category":"exam / test / treat / med / other のどれか","name":"明細の項目名（用紙の表記のまま）","quantity":"数量や日数（用紙の表記のまま。なければ null）","amount":金額（円・数値。なければ null）}]}
+
+ルール:
+- 明細の行は省略せず、用紙に書かれた順にすべて含める。薬は名前と用量を用紙の表記のまま書く。
+- category は、exam=診察料など、test=検査、treat=処置・注射・点滴など、med=処方された薬、other=それ以外（消費税・値引きなど）。
+- 金額は用紙に書かれたとおりに。合計は税込で、保険などの差し引きがあれば差し引き後の支払額にする。
+- 読み取れない、または自信がない項目は含めない。推測で埋めない。
+
+kind のキーの一覧:
+${Object.entries(CARE_KINDS).map(([key, k]) => `${key}: ${k.label}`).join('\n')}`;
+}
+
+function parseCareReply(text) {
+  const a = text.indexOf('{'), b = text.lastIndexOf('}');
+  if (a < 0 || b <= a) return null;
+  let data;
+  try { data = JSON.parse(text.slice(a, b + 1)); } catch (e) { return null; }
+  if (!data || typeof data !== 'object') return null;
+  const money = (v) => (typeof v === 'number' && Number.isFinite(v) && v > 0 && v <= 9999999 ? Math.round(v) : 0);
+  const short = (v, max) => (typeof v === 'string' ? v.replace(/\s+/g, ' ').trim().slice(0, max) : '');
+  const out = {
+    date: isDate(data.date) && data.date <= todayStr() ? data.date : '',
+    hospital: short(data.hospital, 60),
+    total: money(data.total),
+    kind: typeof data.kind === 'string' && Object.prototype.hasOwnProperty.call(CARE_KINDS, data.kind) ? data.kind : '',
+    items: (Array.isArray(data.items) ? data.items : []).slice(0, MAX_CARE_ITEMS)
+      .filter((it) => it && typeof it === 'object' && short(it.name, 80))
+      .map((it) => ({
+        cat: typeof it.category === 'string' && Object.prototype.hasOwnProperty.call(ITEM_CATS, it.category) ? it.category : 'other',
+        name: short(it.name, 80),
+        qty: short(typeof it.quantity === 'number' ? String(it.quantity) : it.quantity, 20),
+        amount: money(it.amount),
+      })),
+  };
+  return out.total || out.items.length ? out : null;
+}
 
 function labForm(dog, rec) {
   const r = rec || { values: {}, photoIds: [] };
@@ -1212,9 +1331,14 @@ const VIEWS = {
         ${history.length ? `<ul class="list">${history.map((c) => `
           <li><button type="button" class="row" data-action="edit-care" data-id="${esc(c.id)}">
             <span class="icon" aria-hidden="true">${CARE_KINDS[c.kind].icon}</span>
-            <span class="body"><strong>${CARE_KINDS[c.kind].label}</strong>${esc(c.title)}${c.memo ? `<small>${esc(c.memo)}</small>` : ''}</span>
+            <span class="body"><strong>${CARE_KINDS[c.kind].label}</strong>${esc(c.title)}${c.memo ? `<small>${esc(c.memo)}</small>` : ''}${
+              c.items.some((it) => it.cat === 'med') ? `<small>💊 ${c.items.filter((it) => it.cat === 'med').map((it) => esc(it.name)).join('、')}</small>` : ''}</span>
             <span class="side">${jpDate(c.date)}${c.cost ? `<br>¥${c.cost.toLocaleString('ja-JP')}` : ''}</span>
-          </button></li>`).join('')}</ul>` : '<p class="empty">まだ記録がありません</p>'}
+          </button>${c.items.length ? `<details class="care-items"><summary>明細 ${c.items.length}件</summary>
+            <table class="data"><tbody>${c.items.map((it) => `<tr>
+              <td><span aria-hidden="true">${ITEM_CATS[it.cat].icon}</span> <span class="muted small">${ITEM_CATS[it.cat].label}</span><div>${esc(it.name)}${it.qty ? ` <span class="muted small">× ${esc(it.qty)}</span>` : ''}</div></td>
+              <td class="num">${it.amount ? yen(it.amount) : ''}</td></tr>`).join('')}</tbody></table></details>` : ''}${c.photoIds.length ? `<div class="photo-strip">${c.photoIds.map((id) =>
+            `<button type="button" class="photo-btn" data-action="view-photo" data-id="${esc(id)}" aria-label="明細書の写真を大きく表示">${photoImg(id, '明細書の写真')}</button>`).join('')}</div>` : ''}</li>`).join('')}</ul>` : '<p class="empty">まだ記録がありません</p>'}
       </section>`;
   },
 
@@ -1486,7 +1610,7 @@ async function importData(file) {
       if (b) blobs.set(id, b);
     }
     next.dogs.forEach((d) => { if (!blobs.has(d.photoId)) d.photoId = ''; });
-    [...next.logs, ...next.labs].forEach((l) => { l.photoIds = l.photoIds.filter((id) => blobs.has(id)); });
+    [...next.logs, ...next.labs, ...next.cares].forEach((l) => { l.photoIds = l.photoIds.filter((id) => blobs.has(id)); });
     if (state.dogs.length && !confirm(`現在のデータ（写真を含む）を、バックアップの内容（${next.dogs.map((d) => d.name).join('、')}）で置き換えます。よろしいですか？`)) return;
     await photoClear();
     for (const [id, b] of blobs) await photoPut(id, b);
