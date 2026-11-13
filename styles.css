@@ -236,6 +236,69 @@ fieldset.group .hint { display: block; margin: 0 0 10px; font-size: .75rem; colo
 .care-items { margin: 0 4px 12px 48px; }
 .care-items summary { font-size: .85rem; color: var(--muted); cursor: pointer; padding: 4px 0; }
 .care-items table.data td { vertical-align: top; }
+/* お薬チェック */
+.dose-group + .dose-group { margin-top: 12px; }
+.dose-group h3 { margin: 0 0 6px; font-size: .8rem; font-weight: 600; color: var(--muted); }
+.dose {
+  display: flex; align-items: center; gap: 10px; width: 100%; min-height: 52px;
+  padding: 8px 12px; margin-bottom: 6px; text-align: left; font: inherit; color: var(--text);
+  border: 1px solid var(--border); border-radius: 12px; background: var(--surface); cursor: pointer;
+}
+.dose .check {
+  flex: none; width: 26px; height: 26px; display: grid; place-items: center;
+  border: 2px solid var(--muted); border-radius: 8px; font-weight: 700; line-height: 1;
+}
+.dose .body { flex: 1; min-width: 0; display: flex; flex-direction: column; overflow-wrap: anywhere; }
+.dose .body small { color: var(--muted); }
+.dose .side { flex: none; font-size: .8rem; color: var(--muted); white-space: nowrap; font-variant-numeric: tabular-nums; }
+.dose[aria-pressed="true"] { background: var(--accent-soft); border-color: var(--accent); }
+.dose[aria-pressed="true"] .check { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); }
+.dose[aria-pressed="true"] .side { color: var(--text); font-weight: 700; }
+.checks { display: flex; flex-wrap: wrap; gap: 8px; }
+.check-pill { display: inline-flex; align-items: center; gap: 6px; padding: 8px 14px; border: 1px solid var(--border); border-radius: 999px; cursor: pointer; }
+.check-pill input { width: 18px; height: 18px; min-height: 0; margin: 0; padding: 0; accent-color: var(--accent); }
+table.med-week { font-size: .85rem; table-layout: fixed; }
+table.med-week th:first-child { width: 30%; }
+table.med-week tbody th { font-size: .85rem; color: var(--text); font-weight: 600; overflow-wrap: anywhere; border-top: 1px solid var(--border); }
+table.med-week td, table.med-week thead th { text-align: center; padding: 8px 0; }
+table.med-week td small { display: block; font-size: .65rem; color: var(--muted); }
+table.med-week td.miss { color: var(--danger); font-weight: 700; }
+table.med-week thead button { border: 0; background: none; padding: 4px 0; font: inherit; color: var(--accent); text-decoration: underline; cursor: pointer; }
+
+/* 血液検査の見くらべ表 */
+:root { --hi-bg: #fde4e0; --lo-bg: #e1edfb; }
+@media (prefers-color-scheme: dark) { :root { --hi-bg: #55271f; --lo-bg: #1e3550; } }
+table.cmp { border-collapse: separate; border-spacing: 0; }
+table.cmp th:first-child {
+  position: sticky; left: 0; z-index: 1; background: var(--surface);
+  min-width: 108px; max-width: 124px; text-align: left; overflow-wrap: anywhere;
+}
+table.cmp tbody th { padding: 8px 6px 8px 4px; font-size: .85rem; font-weight: 600; color: var(--text); border-top: 1px solid var(--border); }
+table.cmp td, table.cmp thead th.num { min-width: 66px; padding: 6px 6px; white-space: nowrap; vertical-align: top; }
+table.cmp td small { display: block; font-size: .7rem; color: var(--muted); }
+table.cmp td .flag { display: block; font-size: .68rem; font-weight: 700; }
+table.cmp td.hi { background: var(--hi-bg); }
+table.cmp td.lo { background: var(--lo-bg); }
+.btn[aria-pressed="true"] { background: var(--accent-soft); border-color: var(--accent); font-weight: 700; }
+.btn-row { align-items: center; }
+
+/* 診察前まとめ */
+.sum-row { display: flex; gap: 10px; padding: 8px 0; border-top: 1px solid var(--border); }
+.sum-row:first-of-type { border-top: 0; }
+.seg.wide + .sum-row { border-top: 0; }
+.sum-label { flex: none; width: 5.5em; font-size: .85rem; color: var(--muted); padding-top: 2px; }
+.sum-val { flex: 1; min-width: 0; display: flex; flex-wrap: wrap; gap: 6px; align-items: baseline; overflow-wrap: anywhere; }
+.sum-val > div { flex-basis: 100%; }
+.sum-big { font-size: 1.25rem; }
+.sum-chip { display: inline-block; padding: 2px 10px; border: 1px solid var(--border); border-radius: 999px; font-size: .88rem; white-space: nowrap; }
+.sum-chip.warn { border-color: var(--warn); color: var(--warn); }
+.sum-list { list-style: none; margin: 0; padding: 0; }
+.sum-list li { display: flex; gap: 10px; padding: 8px 0; border-top: 1px solid var(--border); overflow-wrap: anywhere; }
+.sum-list li:first-child { border-top: 0; }
+.sum-list small { display: block; color: var(--muted); }
+.sum-date { flex: none; width: 5.5em; font-size: .82rem; color: var(--muted); font-variant-numeric: tabular-nums; padding-top: 2px; }
+.sum-ask { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+
 .ai-read { border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; }
 .ai-read summary { font-size: .85rem; font-weight: 600; cursor: pointer; }
 .ai-body { display: flex; flex-direction: column; align-items: flex-start; gap: 8px; margin-top: 10px; }

@@ -40,6 +40,11 @@ const ITEM_CATS = {
 };
 const MAX_CARE_ITEMS = 60;
 
+// お薬チェック：飲ませる時間帯と間隔
+const MED_SLOTS = { morning: '朝', noon: '昼', evening: '夜', bed: '寝る前' };
+const MED_EVERY = { 1: '毎日', 2: '1日おき', 3: '3日に1回', 7: '週に1回' };
+const doseKey = (medId, date, slot) => `${medId}|${date}|${slot}`;
+
 // 血液検査の項目。単位は一般的な表記の目安（病院によって異なる）
 const LAB_ITEMS = [
   ['wbc', '白血球数 (WBC)', '/µL'], ['rbc', '赤血球数 (RBC)', '万/µL'], ['hgb', 'ヘモグロビン (HGB)', 'g/dL'],
@@ -256,7 +261,7 @@ const referencedPhotoIds = (s) => [
 /* ---------- state & storage ---------- */
 
 function emptyState() {
-  return { version: 1, dogs: [], activeDogId: null, weights: [], logs: [], cares: [], labs: [], labRefs: {} };
+  return { version: 1, dogs: [], activeDogId: null, weights: [], logs: [], cares: [], labs: [], labRefs: {}, meds: [], medDone: {} };
 }
 
 // 保存データ・インポートデータを安全な形に整える
@@ -276,6 +281,7 @@ function normalize(raw) {
     hospital: str(d.hospital, 100),
     notes: str(d.notes, 2000),
     photoId: str(d.photoId, 40),
+    ask: str(d.ask, 1000),
   }));
   const ids = new Set(dogs.map((d) => d.id));
 
@@ -342,8 +348,28 @@ function normalize(raw) {
     }
   }
 
+  const meds = arr(raw.meds)
+    .map((m) => ({
+      id: str(m.id, 40) || uid(), dogId: str(m.dogId, 40), name: str(m.name, 80).trim(), dose: str(m.dose, 40).trim(),
+      slots: Object.keys(MED_SLOTS).filter((s) => Array.isArray(m.slots) && m.slots.includes(s)),
+      every: Object.prototype.hasOwnProperty.call(MED_EVERY, m.every) ? Number(m.every) : 1,
+      startDate: date(m.startDate), endDate: date(m.endDate), memo: str(m.memo, 500),
+    }))
+    .filter((m) => ids.has(m.dogId) && m.name && m.startDate && m.slots.length && !m.id.includes('|'));
+  meds.forEach((m) => { if (m.endDate && m.endDate < m.startDate) m.endDate = ''; });
+  // 飲ませた記録は「薬ID|日付|時間帯」→ 時刻。登録のない薬の分は捨てる
+  const medIds = new Set(meds.map((m) => m.id));
+  const medDone = {};
+  if (raw.medDone && typeof raw.medDone === 'object') {
+    for (const [k, v] of Object.entries(raw.medDone)) {
+      const [id, d, slot] = k.split('|');
+      if (!medIds.has(id) || !isDate(d) || !Object.prototype.hasOwnProperty.call(MED_SLOTS, slot) || k !== doseKey(id, d, slot)) continue;
+      medDone[k] = typeof v === 'string' && /^\d{2}:\d{2}$/.test(v) ? v : '';
+    }
+  }
+
   const activeDogId = ids.has(raw.activeDogId) ? raw.activeDogId : (dogs[0] ? dogs[0].id : null);
-  return { version: 1, dogs, activeDogId, weights, logs, cares, labs, labRefs };
+  return { version: 1, dogs, activeDogId, weights, logs, cares, labs, labRefs, meds, medDone };
 }
 
 function load() {
@@ -369,7 +395,7 @@ let state = load();
 const ui = {
   tab: 'home', logDate: todayStr(), weightRange: '1y',
   logMode: 'day', reviewUnit: 'week', reviewAnchor: todayStr(),
-  careMode: 'records', labItem: '',
+  careMode: 'records', labItem: '', labCols: '5', labOnly: false, sumRange: 'visit',
 };
 const labsOf = (dogId) => state.labs.filter((l) => l.dogId === dogId).sort((a, b) => a.date.localeCompare(b.date));
 
@@ -571,7 +597,8 @@ function deleteDog(dog) {
   if (!confirm(`「${dog.name}」と、その記録をすべて削除します。元に戻せません。よろしいですか？`)) return;
   photoDel([dog.photoId, ...[...state.logs, ...state.labs, ...state.cares].filter((l) => l.dogId === dog.id).flatMap((l) => l.photoIds)].filter(Boolean));
   state.dogs = state.dogs.filter((d) => d.id !== dog.id);
-  for (const key of ['weights', 'logs', 'cares', 'labs']) state[key] = state[key].filter((r) => r.dogId !== dog.id);
+  state.meds.filter((m) => m.dogId === dog.id).forEach((m) => dropDoses(m.id));
+  for (const key of ['weights', 'logs', 'cares', 'labs', 'meds']) state[key] = state[key].filter((r) => r.dogId !== dog.id);
   if (state.activeDogId === dog.id) state.activeDogId = state.dogs[0] ? state.dogs[0].id : null;
   commit('削除しました');
 }
@@ -634,6 +661,143 @@ function weightForm(dog, rec) {
     },
     onDelete: rec ? () => { state.weights = state.weights.filter((x) => x.id !== rec.id); commit('削除しました'); } : null,
   });
+}
+
+/* ---------- お薬チェック ---------- */
+
+const hasDose = (k) => Object.prototype.hasOwnProperty.call(state.medDone, k);
+const medsOf = (dogId) => state.meds.filter((m) => m.dogId === dogId);
+const medDue = (m, date) => date >= m.startDate && (!m.endDate || date <= m.endDate) && daysBetween(m.startDate, date) % m.every === 0;
+const medEnded = (m) => !!m.endDate && m.endDate < todayStr();
+const slashDate = (s) => s.replace(/-/g, '/');
+function dropDoses(medId) {
+  for (const k of Object.keys(state.medDone)) if (k.startsWith(`${medId}|`)) delete state.medDone[k];
+}
+
+function medForm(dog, med) {
+  const m = med || {};
+  // 取り込んだ明細にある薬の名前を候補に出す（新しい順）
+  const known = med ? [] : [...new Set(state.cares.filter((c) => c.dogId === dog.id)
+    .sort((a, b) => b.date.localeCompare(a.date))
+    .flatMap((c) => c.items.filter((it) => it.cat === 'med').map((it) => it.name)))].slice(0, 20);
+  const slots = m.slots || ['morning', 'evening'];
+  openForm({
+    title: med ? 'お薬を編集' : 'お薬を登録',
+    fields: [
+      ...(known.length ? [{
+        type: 'custom', html: `<div class="field"><label for="f_medPick">明細の薬から選ぶ <span class="muted small">任意</span></label>
+          <select id="f_medPick" data-role="med-pick"><option value="">選ぶと名前が入ります</option>${known.map((n) => `<option value="${esc(n)}">${esc(n)}</option>`).join('')}</select></div>`,
+      }] : []),
+      { name: 'name', label: '薬の名前', required: true, maxlength: 80, value: m.name },
+      { name: 'dose', label: '1回の量', maxlength: 40, value: m.dose, placeholder: '例：1錠、半錠、0.5ml' },
+      {
+        type: 'custom', html: `<div class="field"><span class="field-label">飲ませる時間</span>
+          <div class="checks">${Object.entries(MED_SLOTS).map(([k, label]) =>
+            `<label class="check-pill"><input type="checkbox" name="slot_${k}"${slots.includes(k) ? ' checked' : ''}> ${label}</label>`).join('')}</div></div>`,
+      },
+      { name: 'every', label: '間隔', type: 'select', plain: true, value: m.every || 1, options: Object.entries(MED_EVERY), hint: '「1日おき」などは、開始日から数えます。' },
+      { name: 'startDate', label: '開始日', type: 'date', required: true, value: m.startDate || todayStr() },
+      { name: 'endDate', label: '終了日（最後に飲ませる日）', type: 'date', value: m.endDate, hint: '決まっていなければ空欄で大丈夫です。飲み終わった薬は、削除せずここに最後の日を入れると記録が残ります。' },
+      { name: 'memo', label: 'メモ', maxlength: 500, value: m.memo, placeholder: '例：食後に、フードに混ぜる' },
+    ],
+    onMount(form) {
+      const pick = $('[data-role="med-pick"]', form);
+      if (pick) pick.addEventListener('change', () => { if (pick.value) form.elements.name.value = pick.value; });
+    },
+    onSubmit(v) {
+      const picked = Object.keys(MED_SLOTS).filter((k) => v[`slot_${k}`]);
+      if (!v.name || !isDate(v.startDate)) return false;
+      if (!picked.length) { toast('飲ませる時間を1つ以上選んでください'); return false; }
+      if (v.endDate && (!isDate(v.endDate) || v.endDate < v.startDate)) { toast('終了日は開始日以降にしてください'); return false; }
+      const data = {
+        name: v.name, dose: v.dose, slots: picked, every: MED_EVERY[v.every] ? Number(v.every) : 1,
+        startDate: v.startDate, endDate: v.endDate || '', memo: v.memo,
+      };
+      if (med) Object.assign(med, data);
+      else state.meds.push({ id: uid(), dogId: dog.id, ...data });
+      commit(med ? '更新しました' : `${data.name} を登録しました`);
+    },
+    onDelete: med ? () => { dropDoses(med.id); state.meds = state.meds.filter((x) => x.id !== med.id); commit('削除しました'); } : null,
+  });
+}
+
+// その日に飲ませる薬を時間帯ごとに並べたチェックリスト。対象がなければ null
+function medChecklist(dog, date) {
+  const due = medsOf(dog.id).filter((m) => medDue(m, date));
+  if (!due.length) return null;
+  let total = 0, done = 0;
+  const html = Object.entries(MED_SLOTS).map(([slot, label]) => {
+    const list = due.filter((m) => m.slots.includes(slot));
+    if (!list.length) return '';
+    return `<div class="dose-group"><h3>${label}</h3>${list.map((m) => {
+      const k = doseKey(m.id, date, slot), on = hasDose(k);
+      total++;
+      if (on) done++;
+      return `<button type="button" class="dose" data-action="toggle-dose" data-id="${esc(m.id)}" data-date="${esc(date)}" data-slot="${slot}" aria-pressed="${on}">
+        <span class="check" aria-hidden="true">${on ? '✓' : ''}</span>
+        <span class="body"><strong>${esc(m.name)}</strong>${m.dose || m.memo ? `<small>${esc([m.dose, m.memo].filter(Boolean).join(' ・ '))}</small>` : ''}</span>
+        <span class="side">${on ? `済み${state.medDone[k] ? ` ${esc(state.medDone[k])}` : ''}` : 'まだ'}</span>
+      </button>`;
+    }).join('')}</div>`;
+  }).join('');
+  return { html, total, done };
+}
+
+function medCard(dog, date, title) {
+  const mc = medChecklist(dog, date);
+  const empty = medsOf(dog.id).length ? 'この日に飲ませる薬はありません' : '飲ませる薬を登録すると、ここにその日の分が並びます。押すだけで「飲ませた」を記録できます。';
+  return `<section class="card">
+    <h2><span>${title}${mc ? ` <span class="muted small">${mc.done}/${mc.total} 済み</span>` : ''}</span>
+      <button type="button" class="btn sm" data-action="goto-meds">お薬の管理</button></h2>
+    ${mc ? mc.html : `<p class="empty">${empty}</p>`}
+  </section>`;
+}
+
+function medsView(dog) {
+  const today = todayStr();
+  const all = medsOf(dog.id);
+  const current = all.filter((m) => !medEnded(m));
+  const ended = all.filter(medEnded).sort((a, b) => b.endDate.localeCompare(a.endDate));
+  const row = (m) => {
+    const left = m.endDate ? daysBetween(today, m.endDate) : null;
+    const badge = m.startDate > today ? `<span class="badge">${shortDate(m.startDate)}から</span>`
+      : left == null ? '' : left < 0 ? '<span class="badge">終了</span>'
+        : left === 0 ? '<span class="badge soon">今日まで</span>' : `<span class="badge${left <= 3 ? ' soon' : ''}">あと${left}日</span>`;
+    return `<li><button type="button" class="row" data-action="edit-med" data-id="${esc(m.id)}">
+      <span class="icon" aria-hidden="true">💊</span>
+      <span class="body"><strong>${esc(m.name)}</strong>${esc(m.dose)}
+        <small>${MED_EVERY[m.every]}・${m.slots.map((s) => MED_SLOTS[s]).join('／')}</small>
+        <small>${slashDate(m.startDate)}〜${m.endDate ? slashDate(m.endDate) : ''}${m.memo ? ` ・ ${esc(m.memo)}` : ''}</small></span>
+      <span class="side">${badge}</span>
+    </button></li>`;
+  };
+
+  // 直近7日の飲ませた状況
+  const days = Array.from({ length: 7 }, (_, i) => addDays(today, i - 6));
+  const weekRows = all.filter((m) => days.some((d) => medDue(m, d))).map((m) => `<tr>
+    <th scope="row">${esc(m.name)}</th>${days.map((d) => {
+      if (!medDue(m, d)) return '<td class="muted" aria-label="対象外">–</td>';
+      const n = m.slots.length, done = m.slots.filter((s) => hasDose(doseKey(m.id, d, s))).length;
+      if (done === n) return '<td aria-label="全部済み">○</td>';
+      if (done > 0) return `<td aria-label="一部済み">△<small>${done}/${n}</small></td>`;
+      return d === today ? '<td class="muted" aria-label="まだ">・</td>' : '<td class="miss" aria-label="記録なし">×</td>';
+    }).join('')}</tr>`).join('');
+
+  return `
+    <button type="button" class="btn primary" data-action="add-med" style="width:100%;margin-bottom:16px">＋ お薬を登録</button>
+    <section class="card">
+      <h2>飲ませている薬</h2>
+      ${current.length ? `<ul class="list">${current.map(row).join('')}</ul>` : '<p class="empty">登録されている薬はありません</p>'}
+    </section>
+    ${weekRows ? `<section class="card">
+      <h2>この7日間</h2>
+      <table class="data med-week"><thead><tr><th></th>${days.map((d) =>
+        `<th><button type="button" data-action="med-day" data-date="${d}" aria-label="${shortDate(d)}の記録を開く">${shortDate(d)}</button></th>`).join('')}</tr></thead>
+        <tbody>${weekRows}</tbody></table>
+      <p class="muted small" style="margin:8px 0 0">○ 全部済み　△ 一部だけ　× 記録なし　– 対象外<br>日付を押すとその日が開き、あとからチェックを付けられます。</p>
+    </section>` : ''}
+    ${ended.length ? `<section class="card"><h2>終了した薬</h2><ul class="list">${ended.map(row).join('')}</ul></section>` : ''}
+    <p class="muted small">量や回数は、動物病院の指示どおりに登録してください。</p>`;
 }
 
 /* ---------- forms: care (vaccines / prevention / vet) ---------- */
@@ -1133,8 +1297,26 @@ function bloodView(dog) {
   const labs = labsOf(dog.id);
   const withData = LAB_ITEMS.filter(([key]) => labs.some((l) => l.values[key] != null));
   if (!withData.some(([key]) => key === ui.labItem)) ui.labItem = withData[0] ? withData[0][0] : '';
-  const recent = labs.filter((l) => Object.keys(l.values).length).slice(-2).reverse(); // 最新, 前回
-  const cell = (lab, key) => (lab && lab.values[key] != null ? `<strong>${lab.values[key]}</strong>${labFlagHtml(labFlag(key, lab.values[key]))}` : '—');
+  // 見くらべ表：新しい検査を左から並べ、基準値外に色、その前の検査からの増減を矢印で出す
+  const filled = labs.filter((l) => Object.keys(l.values).length);
+  const cols = filled.slice(ui.labCols === '12' ? -12 : -5).reverse();
+  const prevValue = (lab, key) => {
+    for (let j = filled.indexOf(lab) - 1; j >= 0; j--) if (filled[j].values[key] != null) return filled[j].values[key];
+    return null;
+  };
+  const cell = (lab, key) => {
+    const v = lab.values[key];
+    if (v == null) return '<td class="num muted">—</td>';
+    const flag = labFlag(key, v), p = prevValue(lab, key);
+    const d = p == null ? null : v - p;
+    const trend = d == null ? '' : Math.abs(d) < 1e-9 ? '→' : `${d > 0 ? '↑' : '↓'}${labNum(Math.abs(d))}`;
+    return `<td class="num${flag === 'H' ? ' hi' : flag === 'L' ? ' lo' : ''}"><strong>${v}</strong>${
+      flag ? `<span class="flag">${flag === 'H' ? '▲高' : '▼低'}</span>` : ''}<small>${trend || '&nbsp;'}</small></td>`;
+  };
+  const isOut = (key) => cols.some((l) => l.values[key] != null && labFlag(key, l.values[key]));
+  const shown = LAB_ITEMS.filter(([key]) => cols.some((l) => l.values[key] != null));
+  const outCount = shown.filter(([key]) => isOut(key)).length;
+  const rowsItems = ui.labOnly ? shown.filter(([key]) => isOut(key)) : shown;
   const item = LAB_BY_KEY[ui.labItem];
   return `
     <button type="button" class="btn primary" data-action="add-lab" style="width:100%;margin-bottom:16px">＋ 血液検査を記録</button>
@@ -1147,16 +1329,19 @@ function bloodView(dog) {
       ${state.labRefs[ui.labItem] ? `<p class="muted small" style="margin:8px 0 0"><span class="band-key"></span>設定した基準値の範囲（${labRefText(ui.labItem)} ${esc(item.unit)}）</p>` : ''}
     </section>
     <section class="card">
-      <h2>検査値 <button type="button" class="btn sm" data-action="edit-refs">基準値を設定</button></h2>
-      <div class="table-scroll"><table class="data"><thead><tr><th>項目</th>
-        <th class="num">${recent[0] ? `最新<br>${shortDate(recent[0].date)}` : ''}</th>
-        <th class="num">${recent[1] ? `前回<br>${shortDate(recent[1].date)}` : ''}</th>
+      <h2>見くらべ表 <button type="button" class="btn sm" data-action="edit-refs">基準値を設定</button></h2>
+      <div class="btn-row" style="margin-bottom:10px">
+        ${seg('lab-cols', ui.labCols, [['5', '直近5回'], ['12', '直近12回']], '並べる回数')}
+        <button type="button" class="btn sm" data-action="lab-only" aria-pressed="${ui.labOnly}">${ui.labOnly ? '✓ ' : ''}基準値外だけ（${outCount}項目）</button>
+      </div>
+      ${rowsItems.length ? `<div class="table-scroll"><table class="data cmp"><thead><tr><th>項目</th>
+        ${cols.map((l, i) => `<th class="num">${i === 0 ? '最新' : i === 1 ? '前回' : `${i + 1}回前`}<br>${shortDate(l.date)}</th>`).join('')}
         <th class="num">基準値</th></tr></thead><tbody>
-        ${withData.map(([key, label, unit]) => `<tr><td>${esc(label)}<div class="muted small">${esc(unit)}</div></td>
-          <td class="num">${cell(recent[0], key)}</td><td class="num">${cell(recent[1], key)}</td>
+        ${rowsItems.map(([key, label, unit]) => `<tr><th scope="row">${esc(label)}<div class="muted small">${esc(unit)}</div></th>
+          ${cols.map((l) => cell(l, key)).join('')}
           <td class="num muted small">${labRefText(key)}</td></tr>`).join('')}
-      </tbody></table></div>
-      <p class="muted small" style="margin:8px 0 0">▲▼は、設定した基準値から外れている値です。結果の見方は、かかりつけの獣医師に確認してください。</p>
+      </tbody></table></div>` : '<p class="empty">基準値から外れた項目はありません</p>'}
+      <p class="muted small" style="margin:8px 0 0">色つきは、設定した基準値から外れた値です（▲高い・▼低い）。↑↓は、その前の検査からの増減です。${cols.length > 3 ? '表は横に動かせます。' : ''}結果の見方は、かかりつけの獣医師に確認してください。</p>
     </section>` : ''}
     <section class="card">
       <h2>検査の記録</h2>
@@ -1169,6 +1354,120 @@ function bloodView(dog) {
           `<button type="button" class="photo-btn" data-action="view-photo" data-id="${esc(id)}" aria-label="検査結果の写真を大きく表示">${photoImg(id, '検査結果の写真')}</button>`).join('')}</div>` : ''}</li>`).join('')}</ul>`
         : '<p class="empty">まだ記録がありません。検査結果の用紙を撮影して、数値と一緒に残せます。</p>'}
     </section>`;
+}
+
+/* ---------- 診察前まとめ ---------- */
+
+const labNum = (n) => String(Math.round(n * 100) / 100);
+
+function summaryRange(dog) {
+  const today = todayStr();
+  const lastVet = state.cares.filter((c) => c.dogId === dog.id && c.kind === 'vet' && c.date < today)
+    .sort((a, b) => b.date.localeCompare(a.date))[0] || null;
+  const mode = ui.sumRange === '30' ? '30' : ui.sumRange === '14' || !lastVet ? '14' : 'visit';
+  const start = mode === '30' ? addDays(today, -29) : mode === '14' ? addDays(today, -13) : lastVet.date;
+  return { start, end: today, lastVet, mode };
+}
+
+function summaryView(dog) {
+  const { start, end, lastVet, mode } = summaryRange(dog);
+  const logs = state.logs.filter((l) => l.dogId === dog.id && l.date >= start && l.date <= end)
+    .sort((a, b) => (b.date + b.time).localeCompare(a.date + a.time));
+  const row = (label, html) => `<div class="sum-row"><span class="sum-label">${label}</span><div class="sum-val">${html}</div></div>`;
+  const none = '<span class="muted">記録なし</span>';
+  const chip = (text, n, warn) => `<span class="sum-chip${warn ? ' warn' : ''}">${warn ? '<span aria-hidden="true">! </span>' : ''}${esc(text)} <strong>${n}</strong>回</span>`;
+  const tally = (type) => {
+    const list = logs.filter((l) => l.type === type);
+    if (!list.length) return none;
+    return LOG_TYPES[type].options.map((o) => [o, list.filter((l) => l.value === o).length]).filter(([, n]) => n)
+      .map(([o, n]) => chip(o, n, isConcern({ type, value: o }))).join('');
+  };
+
+  // 体重
+  const ws = weightsOf(dog.id);
+  const last = ws[ws.length - 1];
+  const base = ws.filter((w) => w.date <= start).pop() || ws.find((w) => w.date > start && w !== last);
+  const weightHtml = last
+    ? `<strong class="sum-big">${fmtKg(last.kg)}kg</strong> <span class="muted small">（${shortDate(last.date)}）</span>${
+      base && base !== last ? `<div>${shortDate(base.date)}の ${fmtKg(base.kg)}kg から <strong>${signed(last.kg - base.kg, fmtKg)}kg</strong></div>` : ''}`
+    : none;
+
+  // 体調のサイン・メモ
+  const concerns = logs.filter(isConcern);
+  const notes = logs.filter((l) => l.type === 'note' || (l.memo && !isConcern(l) && l.type !== 'med'));
+  const logLine = (l) => `<li><span class="sum-date">${shortDate(l.date)}${l.time ? ` ${esc(l.time)}` : ''}</span>
+    <span><strong>${LOG_TYPES[l.type].label}</strong>${l.value ? ` ${esc(l.value)}${LOG_TYPES[l.type].unit || ''}` : ''}${l.memo ? `<small>${esc(l.memo)}</small>` : ''}</span></li>`;
+  const more = (list, max) => (list.length > max ? `<p class="muted small" style="margin:6px 0 0">ほか${list.length - max}件は「記録」タブで見られます。</p>` : '');
+
+  // お薬：期間中に飲ませた薬と、チェックの付いた回数
+  const days = daysIn({ start, end });
+  const meds = medsOf(dog.id).map((m) => {
+    const due = days.filter((d) => medDue(m, d));
+    return { m, plan: due.length * m.slots.length, done: due.reduce((s, d) => s + m.slots.filter((x) => hasDose(doseKey(m.id, d, x))).length, 0) };
+  }).filter((x) => x.plan);
+  const extra = {};
+  for (const l of logs.filter((x) => x.type === 'med')) extra[l.value] = (extra[l.value] || 0) + 1;
+
+  // 血液検査：最新の結果で基準値から外れている項目
+  const labs = labsOf(dog.id).filter((l) => Object.keys(l.values).length);
+  const lab = labs[labs.length - 1], labPrev = labs[labs.length - 2];
+  const out = lab ? LAB_ITEMS.filter(([k]) => lab.values[k] != null && labFlag(k, lab.values[k])) : [];
+
+  return `
+    <div class="btn-row" style="margin-bottom:12px">
+      <button type="button" class="btn" data-action="care-mode" data-value="records">‹ 戻る</button>
+    </div>
+    <section class="card">
+      <h2>診察前まとめ <span class="muted small">${shortDate(start)}〜${shortDate(end)}（${days.length}日間）</span></h2>
+      ${seg('sum-range', mode, [...(lastVet ? [['visit', '前回の通院から']] : []), ['14', '2週間'], ['30', '1か月']], 'まとめる期間', 'wide')}
+      ${row('わんちゃん', `<strong>${esc(dog.name)}</strong> <span class="muted small">${[dog.breed, { male: '男の子', female: '女の子' }[dog.sex], ageText(dog.birthday)].filter(Boolean).map(esc).join(' ・ ')}</span>`)}
+      ${row('前回の通院', lastVet ? `${jpDate(lastVet.date)}${lastVet.title ? `<div class="muted small">${esc(lastVet.title)}</div>` : ''}` : none)}
+      ${dog.notes ? row('持病・アレルギー', esc(dog.notes)) : ''}
+    </section>
+    <section class="card">
+      <h2>先生に聞きたいこと <button type="button" class="btn sm" data-action="edit-ask">${dog.ask ? '編集' : '書く'}</button></h2>
+      ${dog.ask ? `<p class="sum-ask">${esc(dog.ask)}</p>` : '<p class="empty">診察で聞きたいことを、思いついたときにメモしておけます</p>'}
+    </section>
+    <section class="card">
+      <h2>体重・食事・排泄</h2>
+      ${row('体重', weightHtml)}
+      ${row('ごはん', tally('meal'))}
+      ${row('水', tally('water'))}
+      ${row('うんち', tally('poop'))}
+      ${row('おしっこ', tally('pee'))}
+      ${row('体調', tally('symptom'))}
+    </section>
+    <section class="card">
+      <h2>気になるサイン <span class="muted small">${concerns.length}件</span></h2>
+      ${concerns.length ? `<ul class="sum-list">${concerns.slice(0, 15).map(logLine).join('')}</ul>${more(concerns, 15)}` : '<p class="empty">この期間に気になる記録はありません</p>'}
+    </section>
+    <section class="card">
+      <h2>お薬</h2>
+      ${meds.length ? `<ul class="sum-list">${meds.map(({ m, plan, done }) => `<li><span class="sum-date">${done}/${plan}回</span>
+        <span><strong>${esc(m.name)}</strong> ${esc(m.dose)}<small>${MED_EVERY[m.every]}・${m.slots.map((s) => MED_SLOTS[s]).join('／')}　${slashDate(m.startDate)}〜${m.endDate ? slashDate(m.endDate) : ''}</small></span></li>`).join('')}</ul>
+        <p class="muted small" style="margin:6px 0 0">左の数字は「チェックを付けた回数／この期間の予定回数」です。</p>` : '<p class="empty">この期間に登録されている薬はありません</p>'}
+      ${Object.keys(extra).length ? row('そのほかの投薬', Object.entries(extra).map(([n, c]) => chip(n || '名前なし', c, false)).join('')) : ''}
+    </section>
+    <section class="card">
+      <h2>血液検査 <button type="button" class="btn sm" data-action="care-mode" data-value="blood">見くらべ表</button></h2>
+      ${lab ? `${row('最新の検査', jpDate(lab.date))}
+        ${out.length ? `<ul class="sum-list">${out.map(([k, label, unit]) => `<li><span class="sum-date">${labFlag(k, lab.values[k]) === 'H' ? '▲高' : '▼低'}</span>
+          <span><strong>${esc(label)}</strong> ${lab.values[k]} ${esc(unit)}<small>基準値 ${labRefText(k)}${labPrev && labPrev.values[k] != null ? `　前回 ${labPrev.values[k]}` : ''}</small></span></li>`).join('')}</ul>`
+        : `<p class="empty">${Object.keys(state.labRefs).length ? '基準値から外れた項目はありません' : '基準値を設定すると、外れた項目がここに出ます'}</p>`}` : '<p class="empty">まだ記録がありません</p>'}
+    </section>
+    ${notes.length ? `<section class="card">
+      <h2>メモのある記録</h2>
+      <ul class="sum-list">${notes.slice(0, 10).map(logLine).join('')}</ul>${more(notes, 10)}
+    </section>` : ''}
+    <p class="muted small">このまとめは、記録した内容をそのまま並べたものです。診察のときの説明の助けに使ってください。</p>`;
+}
+
+function askForm(dog) {
+  openForm({
+    title: '先生に聞きたいこと',
+    fields: [{ name: 'ask', label: 'メモ', type: 'textarea', plain: true, maxlength: 1000, value: dog.ask || '', placeholder: '例：薬を飲んだあと吐くことがある。量は今のままでよいか。' }],
+    onSubmit(v) { dog.ask = v.ask; commit('保存しました'); },
+  });
 }
 
 /* ---------- view pieces ---------- */
@@ -1233,12 +1532,14 @@ const VIEWS = {
           <p class="small">${last ? `最新の体重 <strong>${fmtKg(last.kg)}kg</strong> <span class="muted">（${shortDate(last.date)}）</span>` : '<span class="muted">体重はまだ記録されていません</span>'}</p>
         </div>
       </section>
+      ${medCard(dog, todayStr(), '今日のお薬')}
       <section class="card">
         <h2>記録する</h2>
         ${quickGrid()}
         <div class="btn-row" style="margin-top:8px">
           <button type="button" class="btn sm" data-action="add-weight">⚖️ 体重を記録</button>
           <button type="button" class="btn sm" data-action="add-care">💉 予防・通院を記録</button>
+          <button type="button" class="btn sm" data-action="goto-summary">📋 診察前まとめ</button>
         </div>
       </section>
       <section class="card">
@@ -1257,8 +1558,10 @@ const VIEWS = {
   },
 
   care(dog) {
-    const body = ui.careMode === 'cost' ? costView(dog) : ui.careMode === 'blood' ? bloodView(dog) : VIEWS.careRecords(dog);
-    return seg('care-mode', ui.careMode, [['records', '予防・通院'], ['cost', '医療費'], ['blood', '血液検査']], '表示の切り替え', 'wide') + body;
+    if (ui.careMode === 'summary') return summaryView(dog);
+    const body = ui.careMode === 'cost' ? costView(dog) : ui.careMode === 'blood' ? bloodView(dog)
+      : ui.careMode === 'meds' ? medsView(dog) : VIEWS.careRecords(dog);
+    return seg('care-mode', ui.careMode, [['records', '予防・通院'], ['meds', 'お薬'], ['cost', '医療費'], ['blood', '血液検査']], '表示の切り替え', 'wide') + body;
   },
 
   logsDay(dog) {
@@ -1274,6 +1577,7 @@ const VIEWS = {
         <h2>${jpDate(ui.logDate)} の記録</h2>
         ${logRows(logsOf(dog.id, ui.logDate))}
       </section>
+      ${medsOf(dog.id).some((m) => medDue(m, ui.logDate)) ? medCard(dog, ui.logDate, 'この日のお薬') : ''}
       <section class="card">
         <h2>この日に追加</h2>
         ${quickGrid()}
@@ -1321,7 +1625,8 @@ const VIEWS = {
     const yearStart = `${new Date().getFullYear()}-01-01`;
     const yearCost = history.filter((c) => c.date >= yearStart).reduce((s, c) => s + c.cost, 0);
     return `
-      <button type="button" class="btn primary" data-action="add-care" style="width:100%;margin-bottom:16px">＋ 予防・通院を記録</button>
+      <button type="button" class="btn primary" data-action="add-care" style="width:100%;margin-bottom:8px">＋ 予防・通院を記録</button>
+      <button type="button" class="btn" data-action="goto-summary" style="width:100%;margin-bottom:16px">📋 診察前まとめを見る</button>
       <section class="card">
         <h2>次回の予定</h2>
         ${up.length ? upcomingRows(up) + '<p class="muted small" style="margin:8px 0 0">タップすると実施を記録できます</p>' : '<p class="empty">予定はありません。ワクチンや予防薬を記録すると、次回の目安が表示されます。</p>'}
@@ -1651,7 +1956,30 @@ const ACTIONS = {
     if (periodOf(ui.reviewUnit, next).start <= todayStr()) { ui.reviewAnchor = next; render(); }
   },
   'goto-day': (el) => { if (isDate(el.dataset.date)) { ui.logDate = el.dataset.date; ui.logMode = 'day'; render(); window.scrollTo(0, 0); } },
-  'care-mode': (el) => { ui.careMode = ['cost', 'blood'].includes(el.dataset.value) ? el.dataset.value : 'records'; render(); },
+  'care-mode': (el) => { ui.careMode = ['cost', 'blood', 'meds'].includes(el.dataset.value) ? el.dataset.value : 'records'; render(); window.scrollTo(0, 0); },
+  'goto-summary': () => { ui.tab = 'care'; ui.careMode = 'summary'; render(); window.scrollTo(0, 0); },
+  'sum-range': (el) => { ui.sumRange = ['14', '30'].includes(el.dataset.value) ? el.dataset.value : 'visit'; render(); },
+  'edit-ask': (el, dog) => dog && askForm(dog),
+  'lab-cols': (el) => { ui.labCols = el.dataset.value === '12' ? '12' : '5'; render(); },
+  'lab-only': () => { ui.labOnly = !ui.labOnly; render(); },
+  'goto-meds': () => { ui.tab = 'care'; ui.careMode = 'meds'; render(); window.scrollTo(0, 0); },
+  'add-med': (el, dog) => dog && medForm(dog, null),
+  'edit-med': (el, dog) => { const m = state.meds.find((x) => x.id === el.dataset.id); if (m && dog) medForm(dog, m); },
+  'med-day': (el) => { if (isDate(el.dataset.date)) { ui.tab = 'logs'; ui.logMode = 'day'; ui.logDate = el.dataset.date; render(); window.scrollTo(0, 0); } },
+  'toggle-dose': (el, dog) => {
+    const m = state.meds.find((x) => x.id === el.dataset.id);
+    const { date, slot } = el.dataset;
+    if (!m || !dog || m.dogId !== dog.id || !isDate(date) || !Object.prototype.hasOwnProperty.call(MED_SLOTS, slot)) return;
+    const k = doseKey(m.id, date, slot);
+    if (hasDose(k)) {
+      if (!confirm(`「${m.name}」（${MED_SLOTS[slot]}）のチェックを取り消しますか？`)) return;
+      delete state.medDone[k];
+      commit('取り消しました');
+    } else {
+      state.medDone[k] = date === todayStr() ? nowTime() : '';
+      commit(`${m.name}（${MED_SLOTS[slot]}）を記録しました`);
+    }
+  },
   'add-lab': (el, dog) => dog && labForm(dog, null),
   'edit-lab': (el, dog) => { const l = state.labs.find((x) => x.id === el.dataset.id); if (l && dog) labForm(dog, l); },
   'edit-refs': () => labRefForm(),
