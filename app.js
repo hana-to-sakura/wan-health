@@ -15,7 +15,7 @@ const LOG_TYPES = {
   med:     { label: 'お薬',     icon: '💊', valueLabel: '薬の名前' },
   symptom: { label: '体調',     icon: '🩺', valueLabel: '様子', options: ['元気', '元気がない', '食欲不振', '嘔吐', '咳・くしゃみ', 'かゆがる', '足をかばう', 'その他'] },
   water:   { label: '水',       icon: '🥣', valueLabel: '飲んだ量', options: ['ふつう', '多い', '少ない'] },
-  photo:   { label: '写真',     icon: '📷', photoRequired: true },
+  photo:   { label: '写真・動画', icon: '📷', photoRequired: true },
   note:    { label: 'メモ',     icon: '📝' },
 };
 
@@ -143,6 +143,9 @@ function toast(msg) {
  */
 
 const MAX_LOG_PHOTOS = 4;
+// 動画は縮小できず、バックアップにも入れないため、1件につき1本・短いものに限る（写真と同じ保存場所に入れる）
+const MAX_VIDEO_SEC = 60;
+const MAX_VIDEO_MB = 200;
 let dbPromise;
 function photoDb() {
   if (!dbPromise) {
@@ -296,6 +299,8 @@ function normalize(raw) {
       type: str(l.type, 20), value: str(l.value, 100), memo: str(l.memo, 1000),
       photoIds: (Array.isArray(l.photoIds) ? l.photoIds : [])
         .filter((p) => typeof p === 'string' && p).map((p) => p.slice(0, 40)).slice(0, MAX_LOG_PHOTOS),
+      videoIds: (Array.isArray(l.videoIds) ? l.videoIds : [])
+        .filter((p) => typeof p === 'string' && p).map((p) => p.slice(0, 40)).slice(0, 1),
     }))
     .filter((l) => ids.has(l.dogId) && l.date && Object.prototype.hasOwnProperty.call(LOG_TYPES, l.type));
 
@@ -436,6 +441,15 @@ function fieldHtml(f) {
         <input type="file" accept="image/*"${f.max > 1 ? ' multiple' : ''} hidden aria-label="${esc(f.label)}">
       </div>${f.hint ? `<span class="hint">${esc(f.hint)}</span>` : ''}</div>`;
   }
+  if (f.type === 'video') {
+    return `<div class="field"><span class="field-label">${esc(f.label)} <span class="muted small">任意</span></span>
+      <div class="photo-field video-field" data-name="${f.name}">
+        <div class="vthumb"></div>
+        <button type="button" class="btn sm" data-role="pick">🎬 動画を選ぶ</button>
+        <input type="file" accept="video/*" hidden aria-label="${esc(f.label)}">
+        <p class="hint warn" data-role="msg" role="status"></p>
+      </div>${f.hint ? `<span class="hint">${esc(f.hint)}</span>` : ''}</div>`;
+  }
   if (f.type === 'select') {
     control = `<select id="${id}" name="${f.name}"${req}>${f.options.map(([v, label]) =>
       `<option value="${esc(v)}"${String(v) === String(val) ? ' selected' : ''}>${esc(label)}</option>`).join('')}</select>`;
@@ -463,8 +477,8 @@ function openForm({ title, fields, onSubmit, onDelete, onMount }) {
       </div>
     </form>`;
   const form = $('form', dlg);
-  const photoFields = fields.filter((f) => f.type === 'photos')
-    .map((f) => ({ f, ctl: mountPhotoField($(`.photo-field[data-name="${f.name}"]`, dlg), f) }));
+  const photoFields = fields.filter((f) => f.type === 'photos' || f.type === 'video')
+    .map((f) => ({ f, ctl: (f.type === 'video' ? mountVideoField : mountPhotoField)($(`.photo-field[data-name="${f.name}"]`, dlg), f) }));
   dlg.addEventListener('close', () => photoFields.forEach(({ ctl }) => ctl.discard()), { once: true });
 
   let busy = false;
@@ -476,12 +490,15 @@ function openForm({ title, fields, onSubmit, onDelete, onMount }) {
     for (const { f, ctl } of photoFields) {
       if (f.required && !ctl.count()) { toast('写真を選んでください'); return; }
     }
+    // requireAny の付いた欄（写真・動画）は、どれか1つに入っていればよい
+    const anyOf = photoFields.filter(({ f }) => f.requireAny);
+    if (anyOf.length && !anyOf.some(({ ctl }) => ctl.count())) { toast('写真か動画を選んでください'); return; }
     busy = true;
     try {
       for (const { f, ctl } of photoFields) values[f.name] = await ctl.commit();
     } catch (err) {
       console.error(err);
-      toast('写真を保存できませんでした（端末の空き容量をご確認ください）');
+      toast('写真・動画を保存できませんでした（端末の空き容量をご確認ください）');
       busy = false;
       return;
     }
@@ -559,6 +576,84 @@ function mountPhotoField(wrap, f) {
   };
 }
 
+// 動画の長さ（秒）。読み込めなければ null、長さが分からない形式は 0
+function videoDuration(url) {
+  return new Promise((resolve) => {
+    const v = document.createElement('video');
+    const done = (x) => { clearTimeout(timer); v.removeAttribute('src'); resolve(x); };
+    const timer = setTimeout(() => done(null), 10000);
+    v.preload = 'metadata';
+    v.muted = true;
+    v.onloadedmetadata = () => done(Number.isFinite(v.duration) ? v.duration : 0);
+    v.onerror = () => done(null);
+    v.src = url;
+  });
+}
+
+// フォーム内の動画欄（1本まで）。写真欄と同じく「保存」を押すまで書き込まない
+function mountVideoField(wrap, f) {
+  let cur = (f.value || [])[0] ? { id: f.value[0], isNew: false } : null;
+  const removed = [];
+  const box = $('.vthumb', wrap), pick = $('[data-role="pick"]', wrap), input = $('input', wrap), msg = $('[data-role="msg"]', wrap);
+  const drop = () => {
+    if (!cur) return;
+    if (cur.isNew) URL.revokeObjectURL(cur.url);
+    else removed.push(cur.id);
+    cur = null;
+  };
+  const draw = () => {
+    box.innerHTML = cur ? '<video controls playsinline preload="metadata"></video><button type="button" class="btn sm danger" data-role="remove">この動画を外す</button>' : '';
+    pick.hidden = !!cur;
+    if (!cur) return;
+    const v = $('video', box);
+    if (cur.isNew) v.src = cur.url;
+    else photoUrl(cur.id).then((url) => { if (url) v.src = url; else msg.textContent = '動画が見つかりません。外して選び直してください。'; });
+  };
+  box.addEventListener('click', (e) => {
+    if (e.target.closest('[data-role="remove"]')) { drop(); msg.textContent = ''; draw(); }
+  });
+  pick.addEventListener('click', () => input.click());
+  input.addEventListener('change', async () => {
+    const file = input.files[0];
+    input.value = '';
+    msg.textContent = '';
+    if (!file) return;
+    if (file.type && !file.type.startsWith('video/')) { msg.textContent = '動画のファイルを選んでください。'; return; }
+    if (file.size > MAX_VIDEO_MB * 1048576) {
+      msg.textContent = `動画が大きすぎます（${Math.round(file.size / 1048576)}MB）。${MAX_VIDEO_MB}MBまでなので、写真アプリで短く切り取ってから選んでください。`;
+      return;
+    }
+    pick.disabled = true;
+    const url = URL.createObjectURL(file);
+    const sec = await videoDuration(url);
+    pick.disabled = false;
+    if (sec == null) { URL.revokeObjectURL(url); msg.textContent = 'この動画は読み込めませんでした。別の動画で試してください。'; return; }
+    if (sec > MAX_VIDEO_SEC + 1.5) {
+      URL.revokeObjectURL(url);
+      msg.textContent = `動画は${MAX_VIDEO_SEC}秒までです（選んだ動画は約${Math.round(sec)}秒）。写真アプリで短く切り取ってから選んでください。`;
+      return;
+    }
+    drop();
+    cur = { id: `v${uid()}`, isNew: true, blob: file, url };
+    draw();
+  });
+  draw();
+
+  return {
+    count: () => (cur ? 1 : 0),
+    async commit() {
+      if (cur && cur.isNew) {
+        await photoPut(cur.id, cur.blob);
+        photoUrls.set(cur.id, cur.url);
+        cur.isNew = false;
+      }
+      await photoDel(removed.splice(0));
+      return cur ? [cur.id] : [];
+    },
+    discard() { if (cur && cur.isNew) URL.revokeObjectURL(cur.url); },
+  };
+}
+
 function commit(msg) { save(); render(); if (msg) toast(msg); }
 
 /* ---------- forms: dog ---------- */
@@ -595,7 +690,7 @@ function dogForm(dog) {
 
 function deleteDog(dog) {
   if (!confirm(`「${dog.name}」と、その記録をすべて削除します。元に戻せません。よろしいですか？`)) return;
-  photoDel([dog.photoId, ...[...state.logs, ...state.labs, ...state.cares].filter((l) => l.dogId === dog.id).flatMap((l) => l.photoIds)].filter(Boolean));
+  photoDel([dog.photoId, ...[...state.logs, ...state.labs, ...state.cares].filter((l) => l.dogId === dog.id).flatMap((l) => [...l.photoIds, ...(l.videoIds || [])])].filter(Boolean));
   state.dogs = state.dogs.filter((d) => d.id !== dog.id);
   state.meds.filter((m) => m.dogId === dog.id).forEach((m) => dropDoses(m.id));
   for (const key of ['weights', 'logs', 'cares', 'labs', 'meds']) state[key] = state[key].filter((r) => r.dogId !== dog.id);
@@ -620,7 +715,8 @@ function logForm(dog, type, log) {
   } else if (def.valueLabel) {
     fields.push({ name: 'value', label: def.valueLabel, required: true, maxlength: 100, value: l.value });
   }
-  fields.push({ name: 'photos', label: '写真', type: 'photos', max: MAX_LOG_PHOTOS, required: !!def.photoRequired, value: l.photoIds || [], hint: `${MAX_LOG_PHOTOS}枚まで。保存時に自動で縮小されます。` });
+  fields.push({ name: 'photos', label: '写真', type: 'photos', max: MAX_LOG_PHOTOS, requireAny: !!def.photoRequired, value: l.photoIds || [], hint: `${MAX_LOG_PHOTOS}枚まで。保存時に自動で縮小されます。` });
+  fields.push({ name: 'video', label: '動画', type: 'video', requireAny: !!def.photoRequired, value: l.videoIds || [], hint: `1本・${MAX_VIDEO_SEC}秒まで。動画はバックアップに含まれないので、元の動画は写真アプリに残しておいてください。` });
   fields.push({ name: 'memo', label: 'メモ', type: 'textarea', value: l.memo, required: type === 'note' });
 
   openForm({
@@ -628,12 +724,12 @@ function logForm(dog, type, log) {
     fields,
     onSubmit(v) {
       if (!isDate(v.date)) return false;
-      const data = { date: v.date, time: v.time || '', value: v.value || '', memo: v.memo || '', photoIds: v.photos };
+      const data = { date: v.date, time: v.time || '', value: v.value || '', memo: v.memo || '', photoIds: v.photos, videoIds: v.video };
       if (log) Object.assign(log, data);
       else state.logs.push({ id: uid(), dogId: dog.id, type, ...data });
       commit('記録しました');
     },
-    onDelete: log ? () => { photoDel(log.photoIds); state.logs = state.logs.filter((x) => x.id !== log.id); commit('削除しました'); } : null,
+    onDelete: log ? () => { photoDel([...log.photoIds, ...log.videoIds]); state.logs = state.logs.filter((x) => x.id !== log.id); commit('削除しました'); } : null,
   });
 }
 
@@ -1506,7 +1602,9 @@ function summaryView(dog) {
   const concerns = logs.filter(isConcern);
   const notes = logs.filter((l) => l.type === 'note' || (l.memo && !isConcern(l) && l.type !== 'med'));
   const logLine = (l) => `<li><span class="sum-date">${shortDate(l.date)}${l.time ? ` ${esc(l.time)}` : ''}</span>
-    <span><strong>${LOG_TYPES[l.type].label}</strong>${l.value ? ` ${esc(l.value)}${LOG_TYPES[l.type].unit || ''}` : ''}${l.memo ? `<small>${esc(l.memo)}</small>` : ''}</span></li>`;
+    <span><strong>${LOG_TYPES[l.type].label}</strong>${l.value ? ` ${esc(l.value)}${LOG_TYPES[l.type].unit || ''}` : ''}${l.memo ? `<small>${esc(l.memo)}</small>` : ''}${
+      l.videoIds.length ? `<div class="photo-strip flat">${videoBtns(l)}</div>` : ''}</span></li>`;
+  const videos = logs.filter((l) => l.videoIds.length);
   const more = (list, max) => (list.length > max ? `<p class="muted small" style="margin:6px 0 0">ほか${list.length - max}件は「記録」タブで見られます。</p>` : '');
 
   // お薬：期間中に飲ませた薬と、チェックの付いた回数
@@ -1551,6 +1649,10 @@ function summaryView(dog) {
       <h2>気になるサイン <span class="muted small">${concerns.length}件</span></h2>
       ${concerns.length ? `<ul class="sum-list">${concerns.slice(0, 15).map(logLine).join('')}</ul>${more(concerns, 15)}` : '<p class="empty">この期間に気になる記録はありません</p>'}
     </section>
+    ${videos.length ? `<section class="card">
+      <h2>動画 <span class="muted small">${videos.length}本</span></h2>
+      <ul class="sum-list">${videos.slice(0, 15).map(logLine).join('')}</ul>${more(videos, 15)}
+    </section>` : ''}
     <section class="card">
       <h2>お薬</h2>
       ${meds.length ? `<ul class="sum-list">${meds.map(({ m, plan, done }) => `<li><span class="sum-date">${done}/${plan}回</span>
@@ -1587,6 +1689,9 @@ function quickGrid() {
     `<button type="button" data-action="add-log" data-type="${k}"><span aria-hidden="true">${t.icon}</span>${t.label}</button>`).join('')}</div>`;
 }
 
+const videoBtns = (l) => l.videoIds.map((id) =>
+  `<button type="button" class="photo-btn video-btn" data-action="view-video" data-id="${esc(id)}" aria-label="動画を再生"><span aria-hidden="true">▶</span>動画</button>`).join('');
+
 function logRows(logs) {
   if (!logs.length) return '<p class="empty">まだ記録がありません</p>';
   return `<ul class="list">${logs.map((l) => {
@@ -1596,8 +1701,8 @@ function logRows(logs) {
       <span class="icon" aria-hidden="true">${t.icon}</span>
       <span class="body"><strong>${t.label}</strong>${value}${l.memo ? `<small>${esc(l.memo)}</small>` : ''}</span>
       <span class="side">${esc(l.time)}</span>
-    </button>${l.photoIds.length ? `<div class="photo-strip">${l.photoIds.map((id) =>
-      `<button type="button" class="photo-btn" data-action="view-photo" data-id="${esc(id)}" aria-label="写真を大きく表示">${photoImg(id, `${t.label}の写真`)}</button>`).join('')}</div>` : ''}</li>`;
+    </button>${l.photoIds.length || l.videoIds.length ? `<div class="photo-strip">${l.photoIds.map((id) =>
+      `<button type="button" class="photo-btn" data-action="view-photo" data-id="${esc(id)}" aria-label="写真を大きく表示">${photoImg(id, `${t.label}の写真`)}</button>`).join('')}${videoBtns(l)}</div>` : ''}</li>`;
   }).join('')}</ul>`;
 }
 
@@ -1775,7 +1880,7 @@ const VIEWS = {
       </section>
       <section class="card">
         <h2>データのバックアップ</h2>
-        <p class="muted small" style="margin-top:0">記録はこの端末のブラウザ内にだけ保存されます。ブラウザのデータを消すと記録も消えるため、定期的にバックアップをおすすめします。バックアップには写真も含まれます。</p>
+        <p class="muted small" style="margin-top:0">記録はこの端末のブラウザ内にだけ保存されます。ブラウザのデータを消すと記録も消えるため、定期的にバックアップをおすすめします。バックアップには写真も含まれます。動画は含まれないので、元の動画は写真アプリに残しておいてください。</p>
         <div class="btn-row">
           <button type="button" class="btn" data-action="export">バックアップを保存</button>
           <button type="button" class="btn" data-action="import">バックアップから復元</button>
@@ -1988,6 +2093,24 @@ function viewPhoto(id) {
   });
 }
 
+function viewVideo(id) {
+  photoUrl(id).then((url) => {
+    if (!url) { toast('動画が見つかりません（復元や機種変更のあとは、付け直しが必要です）'); return; }
+    let dlg = $('#videoDialog');
+    if (!dlg) {
+      dlg = document.createElement('dialog');
+      dlg.id = 'videoDialog';
+      dlg.setAttribute('aria-label', '動画');
+      dlg.innerHTML = '<video controls playsinline></video><button type="button" class="btn">閉じる</button>';
+      document.body.appendChild(dlg);
+      $('button', dlg).addEventListener('click', () => dlg.close());
+      dlg.addEventListener('close', () => { const v = $('video', dlg); v.pause(); v.removeAttribute('src'); v.load(); });
+    }
+    $('video', dlg).src = url;
+    dlg.showModal();
+  });
+}
+
 /* ---------- backup ---------- */
 
 async function exportData() {
@@ -2027,6 +2150,7 @@ async function importData(file) {
     }
     next.dogs.forEach((d) => { if (!blobs.has(d.photoId)) d.photoId = ''; });
     [...next.logs, ...next.labs, ...next.cares].forEach((l) => { l.photoIds = l.photoIds.filter((id) => blobs.has(id)); });
+    next.logs.forEach((l) => { l.videoIds = []; }); // 動画はバックアップに入っていない
     if (state.dogs.length && !confirm(`現在のデータ（写真を含む）を、バックアップの内容（${next.dogs.map((d) => d.name).join('、')}）で置き換えます。よろしいですか？`)) return;
     await photoClear();
     for (const [id, b] of blobs) await photoPut(id, b);
@@ -2059,6 +2183,7 @@ const ACTIONS = {
   'log-next': () => { if (ui.logDate < todayStr()) { ui.logDate = addDays(ui.logDate, 1); render(); } },
   'log-today': () => { ui.logDate = todayStr(); render(); },
   'view-photo': (el) => viewPhoto(el.dataset.id),
+  'view-video': (el) => viewVideo(el.dataset.id),
   'log-mode': (el) => { ui.logMode = el.dataset.value === 'review' ? 'review' : 'day'; render(); },
   'review-unit': (el) => { ui.reviewUnit = el.dataset.value === 'month' ? 'month' : 'week'; render(); },
   'review-prev': () => { ui.reviewAnchor = shiftAnchor(ui.reviewUnit, ui.reviewAnchor, -1); render(); },
