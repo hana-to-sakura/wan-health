@@ -612,6 +612,9 @@ async function videoTakenAt(file) {
     }
     return null;
   };
+  // 候補を集めていちばん古いものを採る。iPhone は選んだ動画を変換して渡すため mvhd が「今」になるが、
+  // 元の撮影日時が文字列（com.apple.quicktime.creationdate など）で残っていることがある
+  const found = [];
   try {
     const moov = await find('moov', 0, file.size);
     const mvhd = moov && await find('mvhd', moov.start, moov.end);
@@ -619,14 +622,23 @@ async function videoTakenAt(file) {
       const b = new DataView(await file.slice(mvhd.start, mvhd.start + 12).arrayBuffer());
       if (b.byteLength >= 12) {
         const sec = b.getUint8(0) === 1 ? b.getUint32(4) * 4294967296 + b.getUint32(8) : b.getUint32(4);
-        const ms = (sec - 2082844800) * 1000; // 1904年起点 → 1970年起点
-        if (plausible(ms)) return new Date(ms);
+        found.push((sec - 2082844800) * 1000); // 1904年起点 → 1970年起点
+      }
+    }
+    if (moov) {
+      const bytes = await file.slice(moov.start, Math.min(moov.end, moov.start + 4 * 1048576)).arrayBuffer();
+      const text = new TextDecoder('latin1').decode(bytes);
+      const re = /(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(Z|[+-]\d{2}:?\d{2})?/g;
+      for (let m = re.exec(text), n = 0; m && n < 50; m = re.exec(text), n++) {
+        const tz = m[7] ? (m[7] === 'Z' ? 'Z' : m[7].replace(/^([+-]\d{2}):?(\d{2})$/, '$1:$2')) : '';
+        found.push(new Date(`${m[1]}-${m[2]}-${m[3]}T${m[4]}:${m[5]}:${m[6]}${tz}`).getTime());
       }
     }
   } catch (e) { console.error(e); }
-  // 選んだ瞬間の時刻が入るだけの端末もあるので、今とほぼ同じなら採用しない
-  const lm = Number(file.lastModified);
-  return plausible(lm) && now - lm > 5 * 60000 ? new Date(lm) : null;
+  found.push(Number(file.lastModified));
+  const best = Math.min(...found.filter(plausible));
+  // 選んだ瞬間の時刻しか入っていない場合は「分からない」として扱う
+  return Number.isFinite(best) && now - best > 5 * 60000 ? new Date(best) : null;
 }
 
 // フォーム内の動画欄（1本まで）。写真欄と同じく「保存」を押すまで書き込まない
@@ -677,7 +689,10 @@ function mountVideoField(wrap, f) {
     draw();
     if (f.onTaken) {
       const at = await videoTakenAt(file);
-      if (at && cur && cur.blob === file) msg.textContent = f.onTaken(at) || '';
+      if (cur && cur.blob === file) {
+        msg.textContent = at ? (f.onTaken(at) || '')
+          : 'この動画には撮影日時が残っていませんでした。日付と時刻は今のままなので、撮った日に直してください。';
+      }
     }
   });
   draw();
