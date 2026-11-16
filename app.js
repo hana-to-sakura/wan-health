@@ -590,6 +590,45 @@ function videoDuration(url) {
   });
 }
 
+// 動画ファイルに書かれた撮影日時を読む（MP4/MOV の mvhd）。なければファイルの更新日時。分からなければ null
+async function videoTakenAt(file) {
+  const now = Date.now();
+  const plausible = (ms) => ms > Date.UTC(2005, 0, 1) && ms < now + 86400000;
+  const header = async (pos) => {
+    const b = new DataView(await file.slice(pos, pos + 16).arrayBuffer());
+    if (b.byteLength < 8) return null;
+    let size = b.getUint32(0), head = 8;
+    const type = String.fromCharCode(b.getUint8(4), b.getUint8(5), b.getUint8(6), b.getUint8(7));
+    if (size === 1 && b.byteLength >= 16) { size = b.getUint32(8) * 4294967296 + b.getUint32(12); head = 16; }
+    else if (size === 0) size = file.size - pos;
+    return size >= head ? { type, size, head } : null;
+  };
+  const find = async (type, start, end) => {
+    for (let pos = start, n = 0; pos + 8 <= end && n < 200; n++) {
+      const h = await header(pos);
+      if (!h) return null;
+      if (h.type === type) return { start: pos + h.head, end: Math.min(end, pos + h.size) };
+      pos += h.size;
+    }
+    return null;
+  };
+  try {
+    const moov = await find('moov', 0, file.size);
+    const mvhd = moov && await find('mvhd', moov.start, moov.end);
+    if (mvhd) {
+      const b = new DataView(await file.slice(mvhd.start, mvhd.start + 12).arrayBuffer());
+      if (b.byteLength >= 12) {
+        const sec = b.getUint8(0) === 1 ? b.getUint32(4) * 4294967296 + b.getUint32(8) : b.getUint32(4);
+        const ms = (sec - 2082844800) * 1000; // 1904年起点 → 1970年起点
+        if (plausible(ms)) return new Date(ms);
+      }
+    }
+  } catch (e) { console.error(e); }
+  // 選んだ瞬間の時刻が入るだけの端末もあるので、今とほぼ同じなら採用しない
+  const lm = Number(file.lastModified);
+  return plausible(lm) && now - lm > 5 * 60000 ? new Date(lm) : null;
+}
+
 // フォーム内の動画欄（1本まで）。写真欄と同じく「保存」を押すまで書き込まない
 function mountVideoField(wrap, f) {
   let cur = (f.value || [])[0] ? { id: f.value[0], isNew: false } : null;
@@ -636,6 +675,10 @@ function mountVideoField(wrap, f) {
     drop();
     cur = { id: `v${uid()}`, isNew: true, blob: file, url };
     draw();
+    if (f.onTaken) {
+      const at = await videoTakenAt(file);
+      if (at && cur && cur.blob === file) msg.textContent = f.onTaken(at) || '';
+    }
   });
   draw();
 
@@ -716,12 +759,25 @@ function logForm(dog, type, log) {
     fields.push({ name: 'value', label: def.valueLabel, required: true, maxlength: 100, value: l.value });
   }
   fields.push({ name: 'photos', label: '写真', type: 'photos', max: MAX_LOG_PHOTOS, requireAny: !!def.photoRequired, value: l.photoIds || [], hint: `${MAX_LOG_PHOTOS}枚まで。保存時に自動で縮小されます。` });
-  fields.push({ name: 'video', label: '動画', type: 'video', requireAny: !!def.photoRequired, value: l.videoIds || [], hint: `1本・${MAX_VIDEO_SEC}秒まで。動画はバックアップに含まれないので、元の動画は写真アプリに残しておいてください。` });
+  // 新しい記録では、動画の撮影日時を日付・時刻に入れる（手で変えたあとは上書きしない）
+  let formEl = null, touched = false;
+  const onTaken = log ? null : (at) => {
+    const d = fmtDate(at), t = `${pad(at.getHours())}:${pad(at.getMinutes())}`;
+    if (!formEl || touched || d > todayStr()) return '';
+    formEl.elements.date.value = d;
+    formEl.elements.time.value = t;
+    return `撮影日時（${shortDate(d)} ${t}）を、日付と時刻に入れました。違っていたら直してください。`;
+  };
+  fields.push({ name: 'video', label: '動画', type: 'video', onTaken, requireAny: !!def.photoRequired, value: l.videoIds || [], hint: `1本・${MAX_VIDEO_SEC}秒まで。動画はバックアップに含まれないので、元の動画は写真アプリに残しておいてください。` });
   fields.push({ name: 'memo', label: 'メモ', type: 'textarea', value: l.memo, required: type === 'note' });
 
   openForm({
     title: `${def.icon} ${def.label}${log ? 'を編集' : 'を記録'}`,
     fields,
+    onMount(form) {
+      formEl = form;
+      for (const name of ['date', 'time']) form.elements[name].addEventListener('input', () => { touched = true; });
+    },
     onSubmit(v) {
       if (!isDate(v.date)) return false;
       const data = { date: v.date, time: v.time || '', value: v.value || '', memo: v.memo || '', photoIds: v.photos, videoIds: v.video };
