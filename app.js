@@ -1852,6 +1852,13 @@ const VIEWS = {
 
   logsDay(dog) {
     const isToday = ui.logDate === todayStr();
+    const dayLogs = logsOf(dog.id, ui.logDate);
+    const countTile = (type) => {
+      const list = dayLogs.filter((l) => l.type === type);
+      const warn = list.filter(isConcern);
+      const sub = warn.length ? `<span style="color:var(--warn)">⚠ ${[...new Set(warn.map((l) => esc(l.value)))].join('・')} ${warn.length}回</span>` : '';
+      return statTile(`${LOG_TYPES[type].icon} ${LOG_TYPES[type].label}`, list.length, '回', sub);
+    };
     return `
       <div class="date-nav">
         <button type="button" class="btn" data-action="log-prev" aria-label="前の日">‹</button>
@@ -1859,9 +1866,13 @@ const VIEWS = {
         <button type="button" class="btn" data-action="log-next" aria-label="次の日"${isToday ? ' disabled' : ''}>›</button>
         <button type="button" class="btn" data-action="log-today"${isToday ? ' disabled' : ''}>今日</button>
       </div>
+      <div class="stats" style="grid-template-columns:repeat(2, 1fr)">
+        ${countTile('pee')}
+        ${countTile('poop')}
+      </div>
       <section class="card">
         <h2>${jpDate(ui.logDate)} の記録</h2>
-        ${logRows(logsOf(dog.id, ui.logDate))}
+        ${logRows(dayLogs)}
       </section>
       ${medsOf(dog.id).some((m) => medDue(m, ui.logDate)) ? medCard(dog, ui.logDate, 'この日のお薬') : ''}
       <section class="card">
